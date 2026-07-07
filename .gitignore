@@ -1,0 +1,7 @@
+__pycache__/
+*.egg-info/
+.venv/
+dist/
+.mcp.json
+.claude/settings.local.json
+wiki/

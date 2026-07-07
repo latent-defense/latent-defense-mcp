@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "latent-defense-mcp"
+version = "0.1.0"
+description = "MCP server for the Latent Defense infrastructure security platform — map repos, discover attack paths, triage findings."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Latent Defense", email = "eng@latentdefense.ai" }]
+readme = "README.md"
+keywords = ["mcp", "security", "infrastructure", "attack-paths", "jepa"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "mcp[cli]>=1.27,<2",
+    "httpx>=0.28,<1",
+    "keyring>=25.6,<27",
+]
+
+[project.urls]
+Homepage = "https://latentdefense.ai"
+Documentation = "https://docs.latentdefense.ai"
+Repository = "https://github.com/latent-defense/latent-defense-mcp"
+
+[project.scripts]
+latent-defense-mcp = "latent_defense_mcp.server:main"
+latent-defense-mcp-init = "latent_defense_mcp.init:main"
+latent-defense-mcp-login = "latent_defense_mcp.login:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["latent_defense_mcp"]
+artifacts = ["latent_defense_mcp/skills/**/*.md"]
