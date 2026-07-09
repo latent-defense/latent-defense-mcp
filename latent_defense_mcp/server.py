@@ -372,7 +372,7 @@ async def connection_status() -> str:
             data = r.json()
             checks["infrastructure_graph"] = {
                 "status": "ok",
-                "repositories": data.get("repository_count") or data.get("repositories", 0),
+                "repositories": data.get("repositories", 0),
             }
         elif r.status_code == 403:
             checks["infrastructure_graph"] = {
@@ -659,7 +659,15 @@ async def search_nodes(repo_id: str, query: str) -> str:
 @mcp.tool()
 async def infra_stats() -> str:
     """Get infrastructure graph stats (repo count, total nodes/edges, storage)."""
-    return json.dumps(await _get("/api/infra/stats", _tool="infra_stats"))
+    result = await _get("/api/infra/stats", _tool="infra_stats")
+    if isinstance(result, dict):
+        for key in ("repositories", "branches_total", "branches_completed", "attack_paths"):
+            if key in result:
+                try:
+                    result[key] = int(result[key])
+                except (TypeError, ValueError):
+                    result[key] = 0
+    return json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -872,11 +880,12 @@ async def run_inference(branch_id: str) -> str:
                 "Use list_branches(repo_id) to see available branches."
             ),
         })
-    return json.dumps(
-        await _post(
-            "/api/inference/run", {"branch_id": branch_id}, _tool="run_inference"
-        )
+    result = await _post(
+        "/api/inference/run", {"branch_id": branch_id}, _tool="run_inference"
     )
+    if isinstance(result, dict):
+        result.pop("task_id", None)
+    return json.dumps(result)
 
 
 @mcp.tool()
@@ -934,9 +943,10 @@ async def ingest_detection(
         body["title"] = title
     if cve:
         body["cve"] = cve
-    return json.dumps(
-        await _post("/api/detections/ingest", body, _tool="ingest_detection")
-    )
+    result = await _post("/api/detections/ingest", body, _tool="ingest_detection")
+    if isinstance(result, dict):
+        result.pop("task_id", None)
+    return json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1863,6 +1873,25 @@ async def _probe_oracle_graph_loaded(expected_branch: str | None = None) -> dict
         return None
 
 
+async def _fetch_encoding_progress() -> dict | None:
+    """Fetch real-time encoding progress from the inference server's encoding-status endpoint."""
+    if _oracle_session is None:
+        return None
+    try:
+        client = await _http()
+        resp = await client.get(
+            f"/api/oracle/sessions/{_oracle_session}/encoding-status",
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            log.warning("encoding-status returned %d", resp.status_code)
+            return None
+        return resp.json()
+    except Exception as e:
+        log.warning("encoding-status fetch failed: %s", e)
+        return None
+
+
 async def _require_loaded_graph() -> str | None:
     """Return a JSON error string if no graph is loaded, else None.
 
@@ -1896,7 +1925,7 @@ async def _require_loaded_graph() -> str | None:
                 "elapsed_secs": elapsed,
                 "message": (
                     f"Graph is still loading ({elapsed}s elapsed). "
-                    "Call oracle_load_status to check progress. "
+                    "Call oracle_load_status for detailed progress. "
                     "Do not call other oracle tools until loading completes."
                 ),
             }
@@ -1905,7 +1934,7 @@ async def _require_loaded_graph() -> str | None:
         {
             "status": "loading",
             "message": (
-                "Graph is still loading. Call oracle_load_status to check progress. "
+                "Graph is still loading. Call oracle_load_status for detailed progress. "
                 "Do not call other oracle tools until loading completes."
             ),
         }
@@ -1979,6 +2008,50 @@ async def oracle_load_branch(branch_id: str) -> str:
     )
 
 
+async def _format_encoding_progress() -> str:
+    """Poll the inference server for encoding progress and return a formatted JSON response."""
+    progress = await _fetch_encoding_progress()
+    if progress and progress.get("stage") is not None:
+        stage_names = {
+            0: "queued", 1: "fetching graph from infrastructure database",
+            2: "checking cache", 3: "computing structural features",
+            4: "computing node embeddings", 5: "computing edge embeddings",
+            6: "running GNN encoder", 7: "building adjacency index",
+            8: "complete", 9: "failed",
+        }
+        stage = progress.get("stage", 0)
+        stage_name = stage_names.get(stage)
+        if stage_name is None:
+            log.warning("Unknown encoding stage %d — update stage_names dict", stage)
+            stage_name = f"stage {stage}"
+        pct = progress.get("progress_pct", 0)
+        elapsed = progress.get("elapsed_secs", 0)
+        batch_info = ""
+        current_batch = progress.get("current_batch", 0)
+        total_batches = progress.get("total_batches", 0)
+        if total_batches > 0:
+            batch_info = f" (batch {current_batch}/{total_batches})"
+
+        if stage == 8:
+            return json.dumps({"status": "loaded", "progress_pct": 100, "message": "Encoding complete."})
+        if stage == 9:
+            return json.dumps({"status": "failed", "error": progress.get("error"), "message": "Encoding failed."})
+
+        return json.dumps({
+            "status": "encoding",
+            "stage": stage_name,
+            "progress_pct": pct,
+            "elapsed_secs": elapsed,
+            "message": f"Encoding {pct}% complete — {stage_name}{batch_info}. "
+                       f"Elapsed: {elapsed}s. Check again in 15-30 seconds.",
+        })
+    return json.dumps({
+        "status": "encoding",
+        "progress_available": False,
+        "message": "Encoding in progress but progress telemetry is unavailable. Check again in 30-60 seconds.",
+    })
+
+
 @mcp.tool()
 async def oracle_load_status() -> str:
     """Check whether the graph has finished loading after oracle_load_branch. Use oracle_wait_for_load() instead for automatic waiting."""
@@ -2036,28 +2109,18 @@ async def oracle_load_status() -> str:
             }
         )
 
-    # Session exists but graph not loaded yet — encoding in progress
-    elapsed = None
-    if _encoding_started_at is not None:
-        elapsed = int(time.time() - _encoding_started_at)
-    if elapsed is not None:
-        return json.dumps(
-            {
-                "status": "loading",
-                "elapsed_secs": elapsed,
-                "message": (
-                    f"Still loading ({elapsed}s elapsed). "
-                    "Latent Defense is analyzing your infrastructure. "
-                    "Check again in 30-60 seconds."
-                ),
-            }
-        )
-    return json.dumps(
-        {
-            "status": "loading",
-            "message": "Still loading. Latent Defense is analyzing your infrastructure. Check again in 30-60 seconds.",
-        }
-    )
+    # Session exists but graph not loaded yet — encoding in progress.
+    # Check if encoding just completed (stage 8) so we can unblock the gate.
+    progress = await _fetch_encoding_progress()
+    if progress and progress.get("stage") == 8:
+        probe = await _probe_oracle_graph_loaded(expected_branch=_load_branch_id)
+        if probe is not None:
+            _graph_loaded = True
+            _encoding_started_at = None
+            _start_keepalive()
+            log.info("encoding complete — oracle gate unlocked for branch %s", _load_branch_id)
+            return json.dumps({"status": "loaded", "message": "Graph encoding complete and loaded.", "result": probe})
+    return await _format_encoding_progress()
 
 
 @mcp.tool()

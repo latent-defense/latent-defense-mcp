@@ -33,8 +33,8 @@ Call ALL of these in parallel (they are independent):
 Format as a compact dashboard. One section per area, 1-2 lines each. Highlight anything that needs attention.
 
 **Infrastructure**
-- `infra_stats` fields: `repositories`, `branches_total`, `branches_completed`, `attack_paths`
-- Example: "30 repositories, 92 branches, 114 attack paths"
+- `infra_stats` fields: `repositories`, `branches_total`, `branches_completed`, `attack_paths`, `total_nodes`, `total_edges`
+- Example: "30 repositories (12,450 nodes, 28,300 edges), 92 branches, 114 attack paths"
 
 **Recent Mapping Runs**
 - `list_mapping_runs` returns array of:
