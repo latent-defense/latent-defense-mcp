@@ -284,3 +284,12 @@ The analysis also extracts **code blocks** — copy-pasteable infrastructure-as-
 - The `provider_sync_status` field tracks whether the internal ticket has been mirrored to the upstream provider. `synced` = yes, `failed` = provider was unreachable at creation time, `skipped` = no provider configured.
 - Remediation results (code blocks, delta summaries) are persisted server-side. They survive service restarts.
 - The ticketing service deduplicates by `path_id` — creating a second ticket for the same path returns the existing ticket.
+
+## Next steps
+
+After creating tickets:
+- Want to review more paths → `/review-paths` or `/triage`
+- Want to find additional attack paths → `/research`
+- Want to set up automated monitoring → `/monitor`
+- Want to check deployment health → `/status`
+- Not sure what to do → `/latent-defense` for the full menu

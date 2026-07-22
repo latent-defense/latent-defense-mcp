@@ -154,6 +154,10 @@ If no webhooks exist, set one up:
    - `new_path` — a new attack path was discovered
    - `status_change` — a path's triage status changed
    - `validation_complete` — sandbox validation finished
+   - `path_acknowledged` — a path was acknowledged
+   - `path_dispatched_to_validator` — a path was sent for sandbox validation
+   - `path_escalated_to_ticketing` — a path was escalated to the ticketing system
+   - `severity_change` — a path's severity changed
 
 3. **Optionally customize the payload** with a Jinja2 template. Default is the full event JSON. Template variables:
    - `{{ event_type }}` — event type string (e.g., "new_path")
@@ -278,3 +282,12 @@ Scan schedules feed the top of this pipeline. Inference schedules feed the middl
 | 422 on `register_webhook` | Invalid event type or malformed events JSON | Events must be a JSON array of strings from the supported set |
 | 422 on `validate_webhook_template` | Jinja2 syntax error in template | Fix the template syntax and re-validate |
 | Test webhook returns non-2xx | Target endpoint rejected the delivery | Check the URL, auth headers, and that the endpoint accepts POST |
+
+## Next steps
+
+After setting up monitoring:
+- Want to review existing attack paths → `/review-paths` or `/triage`
+- Want to explore the graph → `/explore`
+- Want to build a more complex integration → `/build`
+- Want to process scanner output → `/triage-report`
+- Not sure what to do → `/latent-defense` for the full menu

@@ -112,3 +112,11 @@ To check for attack paths, call `triage_stats()` which returns:
 | 403 Forbidden | API key lacks required scopes | Check key permissions in the portal |
 | Connection refused | MCP server cannot reach the deployment | Verify `LATENT_DEFENSE_URL` in `.mcp.json` points to the correct portal URL |
 | 500 Internal Server Error | Backend service error | Check deployment health in the portal admin panel |
+
+## Next steps
+
+After the health check:
+- Everything healthy → `/explore` to browse your graph, or `/research` to find attack paths
+- Issues found → fix them, then re-run `/health-check`
+- No infrastructure mapped → `/map` to start mapping
+- Not sure what to do → `/latent-defense` for the full menu

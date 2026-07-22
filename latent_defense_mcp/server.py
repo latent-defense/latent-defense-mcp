@@ -1263,7 +1263,7 @@ async def create_remediation_ticket(
         target_node: Path target node ID.
         steps: JSON array of path-step objects (source_node/target_node/...).
         step_count: Number of steps in the path.
-        risk_score: Path risk score (0.0-1.0).
+        risk_score: Path risk score (0-100).
         mitre_techniques: JSON array of MITRE ATT&CK technique IDs.
         difficulty: Path difficulty label from the analysis model (e.g., "trivial", "easy", "medium", "hard", "extreme").
         source: Optional origin tag for the ticket.
@@ -2012,6 +2012,7 @@ async def _format_encoding_progress() -> str:
     """Poll the inference server for encoding progress and return a formatted JSON response."""
     progress = await _fetch_encoding_progress()
     if progress and progress.get("stage") is not None:
+        # Mirrors EncodingStage in inference/crates/oracle/src/state.rs — update when stages change.
         stage_names = {
             0: "queued", 1: "fetching graph from infrastructure database",
             2: "checking cache", 3: "computing structural features",
@@ -2388,35 +2389,51 @@ async def oracle_tm_match_refine(top_k: int = 5, max_iterations: int = 3) -> str
 
 
 @mcp.tool()
-async def oracle_submit_attack_path(nodes: str, description: str = "") -> str:
-    """Submit a discovered attack path as a chain of node descriptions (separated by ' -> '). The path is scored for feasibility and forwarded to triage.
+async def oracle_submit_attack_path(
+    nodes: str, description: str = "", report: str = ""
+) -> str:
+    """Submit a discovered attack path as a chain of node descriptions (separated by ' -> '). The path is scored for feasibility and forwarded to triage. Include a report with your full analysis — it travels downstream to triage and the validator.
 
     Args:
         nodes: Node descriptions separated by ' -> '. Example: "public API gateway -> auth service -> database credentials -> production DB"
         description: Optional description of the attack path.
+        report: Full attack path analysis report (markdown). Should include: executive summary, per-hop energy analysis, threat model context, evidence citations, MITRE ATT&CK annotations, and risk assessment. This report travels downstream to triage and the validator — all reasoning must be captured here.
     """
     guard = await _require_loaded_graph()
     if guard:
         return guard
+    params: dict[str, str] = {
+        "nodes": nodes,
+        "description": description,
+    }
+    if report:
+        params["report"] = report
     return await _oracle_call(
         "submit_attack_path",
-        {
-            "nodes": nodes,
-            "description": description,
-        },
+        params,
         _tool="oracle_submit_attack_path",
     )
 
 
 @mcp.tool()
-async def oracle_submit_matched_path(description: str = "") -> str:
-    """Submit attack paths from the current threat model's matched nodes. Requires tm_match or tm_match_refine to have been run first."""
+async def oracle_submit_matched_path(
+    description: str = "", report: str = ""
+) -> str:
+    """Submit attack paths from the current threat model's matched nodes. Requires tm_match or tm_match_refine to have been run first. Include a report with your full analysis — it travels downstream to triage and the validator.
+
+    Args:
+        description: Optional description of the attack path.
+        report: Full attack path analysis report (markdown). Should include: executive summary, per-hop energy analysis, threat model context, evidence citations, MITRE ATT&CK annotations, and risk assessment. This report travels downstream to triage and the validator — all reasoning must be captured here.
+    """
     guard = await _require_loaded_graph()
     if guard:
         return guard
+    params: dict[str, str] = {"description": description}
+    if report:
+        params["report"] = report
     return await _oracle_call(
         "submit_matched_path",
-        {"description": description},
+        params,
         _tool="oracle_submit_matched_path",
     )
 

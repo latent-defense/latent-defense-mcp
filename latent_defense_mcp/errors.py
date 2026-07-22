@@ -141,18 +141,44 @@ TOOL_SCOPES: dict[str, str] = {
 }
 
 
+def _parse_envelope(response: httpx.Response) -> dict | None:
+    """Extract the ``error`` envelope from a response, if present."""
+    try:
+        body = response.json()
+        env = body.get("error")
+        if isinstance(env, dict) and "code" in env and "message" in env:
+            return env
+    except Exception:
+        pass
+    return None
+
+
 def handle_response(
     response: httpx.Response,
     *,
     tool_name: str | None = None,
 ) -> None:
-    """Check an HTTP response and raise McpApiError with actionable guidance."""
+    """Check an HTTP response and raise McpApiError with actionable guidance.
+
+    Prefers the structured error envelope (``{error: {code, message, hint}}``)
+    when present, falling back to per-status heuristics.
+    """
     if response.is_success:
         return
 
     portal_url = os.environ.get("LATENT_DEFENSE_URL", "https://portal.latentdefense.ai")
 
     status = response.status_code
+
+    envelope = _parse_envelope(response)
+    if envelope and status not in (401, 403):
+        parts = [_sanitize_error(envelope["message"])]
+        hint = envelope.get("hint")
+        if hint:
+            parts.append(hint)
+        if tool_name:
+            parts.append(f"Tool: {tool_name}")
+        raise McpApiError("\n".join(parts))
 
     if status == 401:
         raise McpApiError(
@@ -217,5 +243,5 @@ def handle_response(
         )
 
     raise McpApiError(
-        f"Request failed with status {status}.\nResponse: {response.text[:500]}"
+        f"Request failed with status {status}.\nResponse: {_sanitize_error(response.text[:500])}"
     )

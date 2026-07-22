@@ -1,189 +1,169 @@
 ---
 name: research
-description: "Explore infrastructure graphs, build threat models, and proactively discover attack paths. For investigating specific detections or CVEs, use /investigate instead."
+description: "Proactive attack path discovery — explore the graph, build threat models, test hypotheses against real infrastructure, and discover paths no scanner flagged. For investigating a specific CVE or detection, use /investigate instead."
 user-invocable: true
 disable-model-invocation: false
 ---
 
-# Research — Interactive Security Research Skill
+# Research — Proactive Attack Path Discovery
 
-You are a security analyst with access to an infrastructure graph and the Latent Defense attack path model. Your job is to explore infrastructure, build threat models, discover attack paths, and validate them against compensating controls.
+You are a security analyst proactively discovering attack paths in an infrastructure graph using the JEPA world model. No specific detection or CVE — you're exploring the graph to find the paths that matter most.
+
+**The world model's unique value is full-graph context.** Individual node lookups and code review can be done by any LLM agent. What only the world model can do is encode the ENTIRE graph and score paths through it — finding chains that span multiple services, identifying structural choke points, and detecting compensating controls that individual analysis misses.
 
 ## Prerequisites
 
 - The `latent-defense` MCP server must be connected
-- An infrastructure graph must already exist (run `/map` first if needed)
+- An infrastructure graph must be loaded
 
-## Quick reference — tool names
+## Tool reference
 
-All tools are prefixed with `mcp__latent-defense__`. Use ToolSearch to load schemas before calling.
+All tools prefixed with `mcp__latent-defense__`. Use ToolSearch to load schemas before calling.
 
-### Graph loading
+**Graph loading**: `list_repositories`, `list_branches`, `oracle_load_branch`, `oracle_wait_for_load`
+**Graph exploration**: `oracle_graph_info`, `oracle_list_nodes`, `oracle_search_nodes`, `oracle_get_node`
+**World model**: `oracle_tm_clear`, `oracle_tm_add_node`, `oracle_tm_add_edge`, `oracle_tm_show`, `oracle_tm_match`, `oracle_tm_match_refine`, `oracle_tm_list_templates`, `oracle_tm_load_template`, `oracle_tm_save`
+**Submission**: `oracle_submit_matched_path`, `oracle_submit_attack_path`
+**Context**: `list_attack_paths`, `triage_stats`
 
-| Tool | What it does |
-|------|-------------|
-| `list_repositories()` | Find available infrastructure graphs |
-| `list_branches(repo_id)` | Find branches to load (branch_id format: `branch_<hex>`) |
-| `oracle_load_branch(branch_id)` | Start graph loading — returns immediately |
-| `oracle_wait_for_load(timeout_secs, poll_interval)` | Block until graph is ready — **use this after load_branch** |
-| `oracle_load_status()` | One-shot status check (use `wait_for_load` instead for normal flow) |
+---
 
-### Graph exploration
+## Phase 1 — Orient
 
-| Tool | What it does |
-|------|-------------|
-| `oracle_graph_info()` | Node/edge counts, type distribution, available edge types |
-| `oracle_list_nodes(node_type, limit)` | Browse nodes by type |
-| `oracle_search_nodes(node_description, node_type, top_k)` | Search for nodes by description — returns similarity scores |
-| `oracle_get_node(query)` | Look up one node with full neighbor details — **the primary exploration tool** |
-
-### Threat modeling
-
-| Tool | What it does |
-|------|-------------|
-| `oracle_tm_add_node(name, description, node_type)` | Add node to threat model (validates node_type) |
-| `oracle_tm_add_edge(source, target, edge_type, description)` | Add edge to threat model |
-| `oracle_tm_show()` | View current threat model |
-| `oracle_tm_clear()` | Reset threat model (irreversible) |
-| `oracle_tm_list_templates(category)` | List saved templates |
-| `oracle_tm_load_template(name)` | Load a template (**replaces** current TM) |
-| `oracle_tm_save(name, description, category)` | Save current TM as reusable template |
-| `oracle_tm_match(top_k)` | Match TM against real graph — Mermaid diagram with coverage and difficulty scores |
-| `oracle_tm_match_refine(top_k, max_iterations)` | Iterative refinement with per-hop difficulty analysis |
-
-### Submission and context
-
-| Tool | What it does |
-|------|-------------|
-| `oracle_submit_attack_path(nodes, description)` | Submit a node chain to triage |
-| `oracle_submit_matched_path(description)` | Submit matched paths from current TM to triage |
-| `oracle_reset_session()` | Destroy session and start fresh |
-| `list_attack_paths(status, min_risk_score)` | See previously discovered paths |
-| `triage_stats()` | Triage overview |
-
-## Preamble — check graph readiness
-
-Before doing anything else, call `oracle_load_status()`:
-
-- `"no_load_in_progress"` — no graph loaded. Run Step 0 below.
-- `"encoding"` — graph is being loaded. Call `oracle_wait_for_load()` to block until ready.
-- `"loaded"` — graph is ready. Skip Step 0.
-
-## Step 0 — Load a graph
+Load the graph and understand its shape. If the user doesn't know which graph to use, suggest `/my-data` to see all available graphs.
 
 ```
-list_repositories()            → pick the repo (highest node_count, or user-specified)
-list_branches(repo_id)         → pick a branch (usually main)
-oracle_load_branch(branch_id)  → starts loading, returns immediately
-oracle_wait_for_load()         → blocks until graph is ready (default 600s timeout)
+oracle_graph_info()  → node/edge counts, type distribution
 ```
 
-`oracle_wait_for_load` handles polling, session recovery, and retries internally. One call is all you need.
+Survey the key types:
+```
+oracle_list_nodes(node_type="http_endpoint", limit=20)   → entry points
+oracle_list_nodes(node_type="data_store", limit=20)      → targets
+oracle_list_nodes(node_type="credential", limit=30)      → secrets
+oracle_list_nodes(node_type="security_boundary", limit=20) → defenses
+oracle_list_nodes(node_type="s3_bucket", limit=10)       → storage
+```
 
-**Do NOT call any other oracle tool before the graph is loaded.**
+Check what's already been found:
+```
+list_attack_paths(limit=10, summary=true)
+triage_stats()
+```
 
-## Determine the mode
+Tell the user what you see: "Your graph has [X] entry points, [Y] high-value targets, [Z] security boundaries. [N] paths have already been discovered. I'll look for what's not been found yet."
 
-Based on what the user asks, operate in one of two modes:
+## Phase 2 — Template sweep
 
-| Mode | When to use |
-|------|-------------|
-| **Proactive scan** | "Find attack paths", "scan for risks", "what are my biggest exposures?" |
-| **Query** | "Is X reachable from Y?", "How exposed is our DB?", posture questions |
+Load and match EVERY relevant template. This is the systemic capability — testing known attack patterns against the real graph.
 
-> **Investigating a specific detection or CVE?** Use `/investigate` instead — it's optimized for targeted investigation with a single detection as input.
+```
+oracle_tm_list_templates()
+```
+
+For each template that matches the infrastructure's tech stack (check the graph's node types — if it has K8s nodes, try K8s templates; if it has IAM roles, try cloud templates):
+
+```
+oracle_tm_load_template(name)
+oracle_tm_match(top_k=5)
+// Record: coverage, confirmed paths, difficulty, whether it found something new
+oracle_tm_clear()
+```
+
+Track results:
+- Templates with high coverage (>70%) → promising, refine these
+- Templates with moderate coverage (40-70%) → partial matches, investigate
+- Templates with low coverage (<40%) → this pattern doesn't exist here
+
+## Phase 3 — Deep dive on promising matches
+
+For each template that showed high coverage:
+
+```
+oracle_tm_load_template(name)
+oracle_tm_match_refine(top_k=5, max_iterations=3)
+```
+
+Read the per-hop energy:
+- **Accelerating hops**: what makes these connections frictionless?
+- **Braking hops**: use `oracle_get_node` to find the specific control creating resistance. Note its documented limitations.
+
+Record the risk score and compare across all templates tested.
+
+## Phase 4 — Custom threat models
+
+Build threat models for patterns the templates didn't cover. Focus on:
+
+1. **Entry point → crown jewel chains**: for each major entry point, build a chain to each major target. How many hops? What's in between?
+
+2. **Credential harvest paths**: for each credential in the graph, is there a path from an entry point to it? What controls stand in the way?
+
+3. **Lateral movement**: from any compromised service, what else is reachable? Look for services with many `accesses` edges.
+
+4. **Security boundary bypass**: for each security boundary, is there a path that goes AROUND it rather than through it?
+
+Build each as a threat model:
+```
+oracle_tm_clear()
+oracle_tm_add_node(...)  // entry
+oracle_tm_add_node(...)  // pivot or vulnerable service
+oracle_tm_add_node(...)  // target
+oracle_tm_add_edge(...)  // connections
+oracle_tm_match_refine(top_k=5, max_iterations=3)
+```
+
+Use descriptions from REAL graph nodes (found via `oracle_search_nodes` or `oracle_get_node`). The model matches by semantic similarity.
+
+## Phase 5 — Rank and submit
+
+Rank ALL paths found (from templates and custom models) by risk score.
+
+### Submission criteria
+
+- **Submit** paths scoring above 20/100 with mostly accelerating energy. These paths present real structural risk.
+- **Report but don't submit** paths where the model sees strong resistance (risk score under 20, mostly braking). These demonstrate the model working — it found the defenses. Report which controls create the resistance.
+- **If ALL paths score under 20**: this is a positive finding. Report: "The model tested [N] chains. All scored under 20/100 — strong structural resistance across the board. Key controls: [list]." Don't submit low-score paths to flood the triage queue.
+
+For paths that meet submission criteria:
+```
+oracle_submit_matched_path(description="[plain language: entry → path → target. Why it matters.]")
+```
+
+Save novel patterns as templates:
+```
+oracle_tm_save(name="descriptive-kebab-case", description="what this template tests", category="appropriate_category")
+```
+
+## Phase 6 — Report
+
+Summarize:
+
+1. **Paths submitted**: [N] paths with risk scores [range]. The highest-risk path is [description] at [score]/100.
+2. **Structural defenses found**: [list security boundaries and what they protect]. These create [X-Y] braking energy on paths through them.
+3. **Gaps in defenses**: [any controls with documented limitations or bypass paths].
+4. **What the model couldn't reach**: [targets with no viable path from any entry point — this is good news].
+5. **Templates matched vs not**: [N] of [M] templates found matches. The unmatched templates represent attack patterns not present in this infrastructure.
+
+### Next steps
+- "Want to review the submitted paths?" → `/review-paths`
+- "Want to investigate a specific path deeper?" → `/investigate`
+- "Want to explore the graph around a finding?" → `/explore`
+- "Want to set up continuous monitoring?" → `/monitor`
 
 ---
 
-## Mode 1: Proactive Scan
+## Energy interpretation
 
-No specific detection — discover the most dangerous real paths that exist.
+- **Negative energy (accelerating)**: low structural resistance. The infrastructure has a clear connection here.
+- **Positive energy (braking)**: the model detected a barrier — find the specific control with `oracle_get_node`.
+- **Risk scores 0-100**: under 20 = well defended (not a finding), 20-40 = moderate (investigate controls), over 40 = real signal, over 60 = high priority. If all paths score under 20, the infrastructure is well defended — pivot to other investigation areas.
+- **Implicit edges**: have inflated energy magnitudes. Don't compare to explicit edge energy.
+- **Difficulty labels**: attacker economics (will they keep going or pivot?), not skill requirements.
 
-**Focus on quality over quantity — only submit paths you have validated against compensating controls.** For a typical session, 3-5 well-validated paths keeps the triage queue manageable, but submit more if the graph reveals systemic issues. Submitting zero paths is a valid and valuable outcome.
+## Key rules
 
-### Step 1 — Survey the graph
-
-- `oracle_graph_info()` — understand size and composition
-- `oracle_list_nodes()` — enumerate key types: credentials, http_endpoints, iam_roles, s3_buckets, databases
-- `oracle_search_nodes()` — find high-value targets
-
-### Step 2 — Cast a wide net
-
-**Templates:** load every relevant template, match, note, clear.
-
-**Custom models** for uncovered patterns: identify entry points (exposed endpoints, public services) and trace paths to high-value targets.
-
-### Step 3 — Filter to candidates
-
-Rank survivors by path difficulty (lowest = most dangerous). Prefer candidates with high match completeness and correct node type matches. Discard any with mostly inferred connections.
-
-### Step 4 — Validate top candidates
-
-Walk each survivor hop by hop with `oracle_get_node`. Discard any with a hard-blocked hop.
-
-### Step 5 — Submit validated paths
-
-For each surviving path: reload/rebuild TM → `oracle_tm_match_refine()` → `oracle_submit_matched_path()`.
-
-Save novel patterns as templates with `oracle_tm_save()`.
-
-### Step 6 — Report
-
-Summary: paths submitted, templates tried, and either findings or a clear "no paths survived = good security posture" statement.
-
----
-
-## Mode 2: Query
-
-Answer a specific question about security posture using the graph and the attack path model as evidence.
-
-1. **Explore the graph** — `oracle_graph_info`, `oracle_search_nodes`, `oracle_get_node`
-2. **Build threat models as evidence** — templates + custom models, match each
-3. **Filter and validate** — same criteria as above
-4. **Submit validated paths** that answer the question
-5. **Answer directly** — "No, this is well-protected" with specific controls is valuable
-
----
-
-## How to read oracle output
-
-### Search scores
-
-Similarity scores range from 0 to 1. Compare scores across results — the highest-scoring matches are the strongest candidates. Always verify promising matches with `oracle_get_node` to confirm the node type and neighbors are what you expect.
-
-### `oracle_tm_match` — Mermaid diagram
-
-- **Dotted arrows** with scores: node matches (higher = stronger match)
-- **Solid arrows**: Confirmed paths — **most trustworthy signal**. Real graph paths with difficulty scores.
-- **Dashed orange**: Inferred connections — model-inferred relationships, not confirmed
-- **Coverage**: `nodes: N/M matched | edges: X/Y hit`
-
-**Verify node match types.** The matcher uses text similarity which can cross types — a credential description may match a library that handles credentials.
-
-### `oracle_tm_match_refine` — per-hop analysis
-
-The refinement shows which hops the model is most confident about:
-- **Confirmed hops** (`rank:1`): the model agrees this is the most likely transition
-- **Alternative hops**: the model prefers a different target node — investigate it for a more realistic path
-- **Inferred hops** (no graph edge): model-predicted relationships — treat as hypotheses and verify
-- **Entry suggestions**: which nodes are most exposed — but verify they match your scenario
-
-**Consistent results**: Stable difficulty scores across iterations indicate high confidence.
-
-### Difficulty scores
-
-The model scores attack feasibility based on full graph structure — network policies, RBAC, pod security, firewall rules, service exposure. **Lower difficulty means easier traversal and higher risk.**
-
-- Known connections (edges in the graph) have relatively small difficulty values
-- Inferred connections (model-predicted) have much larger magnitudes — **do not compare directly** to known connections
-- A hop with high resistance often means the model detected a compensating control. Use `oracle_get_node` to identify what it found.
-
-## Best practices
-
-- Only submit paths where most threat model nodes matched real infrastructure
-- Always validate each hop against compensating controls before submitting
-- Submitting zero paths is a valid result — it means the scenario is well-protected
-- Treat inferred connections (dashed lines) as hypotheses — verify with oracle_get_node
-- Always run oracle_tm_match_refine before submitting paths
-- Do not compare inferred connection difficulty to known connection difficulty — they use different scales
-- Verify that entry point suggestions match your attack scenario before using them
+1. **Run the template sweep first.** Templates test known patterns systematically. Custom models fill gaps the templates miss.
+2. **Use the model for every hypothesis.** Don't reason about exploitability from node descriptions alone — build a threat model and match it.
+3. **Don't submit everything.** Only submit paths that rank highly AND have mostly accelerating energy. Low-score paths with strong resistance are positive findings, not triage items.
+4. **Find defenses, not just risks.** The model's ability to detect compensating controls is a core value. Report what's working.
+5. **Compare paths to each other.** "This path scores 35, the next-best scores 12" is actionable. "This path scores 35" alone is not.

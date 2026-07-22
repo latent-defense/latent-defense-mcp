@@ -20,7 +20,7 @@ Work through the attack path triage queue. For each path: review the details, de
 |------|-------------|
 | `list_attack_paths(status, min_risk_score, limit, offset)` | Query attack paths with optional filters |
 | `get_attack_path(path_id)` | Full path details: steps, MITRE mappings, risk score, difficulty |
-| `update_path_status(path_id, status, reason)` | Change a path's triage status |
+| `update_path_status(path_id, status, note)` | Change a path's triage status |
 | `validate_path(path_id)` | Dispatch to sandbox validation |
 | `escalate_path(path_id)` | Send a validated path to the ticketing system |
 | `get_validation_status(run_id)` | Check sandbox validation progress |
@@ -126,7 +126,7 @@ Returns the full `TriagePath` object:
 |--------|----------|-------------|
 | **Validate** | `validate_path(path_id)` | Path looks plausible, send to sandbox for real exploit attempt |
 | **Acknowledge** | `update_path_status(path_id, "acknowledged")` | Path is real but not urgent, mark as seen |
-| **Dismiss** | `update_path_status(path_id, "closed", reason="...")` | False positive or acceptable risk. Ask for a reason. |
+| **Dismiss** | `update_path_status(path_id, "false_positive", note="...")` | False positive or acceptable risk. Ask for a reason. |
 | **Escalate** | `escalate_path(path_id)` | Path is validated and needs remediation NOW |
 | **Skip** | (no call) | Move to next path without changing status |
 
@@ -181,14 +181,27 @@ When the queue is empty or the user wants to stop, show a session summary:
 ### Next steps
 
 After completing triage:
-- For validated paths that need remediation, use `/remediate` to create tickets
-- For ongoing monitoring, use `/monitor` to set up automated scanning and alerting
+- "Want to create remediation tickets?" → `/remediate`
+- "Want to investigate a specific path deeper?" → `/investigate` with the path's entry node or target
+- "Want to explore the graph around a finding?" → `/explore`
+- "Want to find more paths proactively?" → `/research`
+- "Want to set up monitoring for new paths?" → `/monitor`
+- "Want to process scanner output against this graph?" → `/triage-report`
 
-## How to read difficulty scores
+## How to read risk scores and difficulty
 
-The attack path model scores attack feasibility from full graph structure -- network policies, RBAC bindings, pod security contexts, firewall rules, service exposure. **Lower difficulty = easier traversal = higher risk.**
+**Risk scores are 0–100** (momentum model). They integrate per-hop energy along the path. The bands have real meaning:
+- **0–20**: strong structural resistance. Most hops brake. Infrastructure is well-defended here.
+- **20–40**: moderate resistance. Mixed signal — investigate what's braking.
+- **40–60**: low resistance. Multiple accelerating hops. Deserves attention.
+- **60–80**: little resistance. Most hops accelerate. High priority.
+- **80–100**: almost no resistance across the path.
 
-Rank paths by difficulty score to prioritize triage -- compare within the queue rather than against fixed bands. A path with the lowest difficulty in your queue is the easiest for an attacker to exploit and should be reviewed first.
+A score of 15 means the infrastructure is well defended on this path. If all paths in the queue score under 20, the conclusion is "well defended" — dismiss or acknowledge these paths rather than escalating. Focus attention on paths scoring 40+.
+
+**Difficulty labels** (trivial/easy/medium/hard/extreme) describe attacker economics, not skill requirements. "Easy" means an attacker (human or AI) would continue along this path rather than pivoting. "Extreme" means the structural resistance makes pivoting more rational.
+
+**Per-hop energy** (visible in the full path report): negative = accelerating (low resistance), positive = braking (control detected). When you see braking energy, the path description often identifies the specific control.
 
 ## How to read MITRE techniques
 
