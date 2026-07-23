@@ -90,7 +90,7 @@ Do NOT use `sysconfig.get_path('scripts')` — it returns the global scripts dir
 
 Show the user which path was found. If none found, tell them to install:
 ```
-pip install git+https://github.com/latent-defense/latent-defense-mcp.git
+pip install git+https://github.com/latent-defense/mcp-server.git
 ```
 
 Ask: "Ready to continue?"

@@ -74,7 +74,7 @@ Do NOT use `sysconfig.get_path('scripts')` — it returns the global scripts dir
 
 If no binary is found, tell the user to install the package first:
 ```
-pip install git+https://github.com/latent-defense/latent-defense-mcp.git
+pip install git+https://github.com/latent-defense/mcp-server.git
 ```
 
 ## Step 3 — Write .mcp.json

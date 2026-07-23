@@ -108,3 +108,13 @@ If everything is healthy, say: "All systems operational. No issues detected."
 | Any tool returning an error | That specific service may be down | Report the service as unreachable in the dashboard; continue with other tools |
 
 If any individual tool call fails, report that section as "unavailable" and continue with the rest. The dashboard should never fail entirely because one backend service is down.
+
+## Next steps
+
+Based on what the dashboard shows:
+- New attack paths to review → `/review-paths` or `/triage`
+- No infrastructure mapped yet → `/map`
+- Want to explore the graph → `/explore`
+- Need to set up monitoring → `/monitor`
+- Deployment issues → `/health-check` for a deeper check
+- Not sure what to do → `/latent-defense` for the full menu

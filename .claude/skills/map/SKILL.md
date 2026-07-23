@@ -31,34 +31,32 @@ If the user hasn't specified what to map, ask them. Supported scope types:
 | Web endpoints | URLs | HTTP probing, technology fingerprinting |
 | CIDRs | network ranges | Port scanning, service discovery |
 
-### Step 2 — Determine the credential profile
+### Step 2 — Credential profile
 
-The mapper needs credentials to access the targets. Ask the user which credential profile to use. They can find their profiles in **Settings → Credentials** in the portal.
-
-Common profiles:
-- `github` — GitHub PAT for private repository access
-- `default` — default profile, often has cloud credentials
-- Custom names like `aws-prod`, `azure-staging`, etc.
-
-If the user doesn't know their profile name, suggest they check the portal.
+All mapping runs use the `default` credential profile. This profile is configured in the customer's deployment with all necessary credentials (GitHub, AWS, Azure, GCP). Do not ask the user to specify a profile — always use `"default"`.
 
 ### Step 3 — Create the mapping run
 
-Call `create_mapping_run` with the scope and credential profile. Examples:
+Call `create_mapping_run` with the scope. **Always use `credentials_profile="default"`** — this is the profile configured in the customer's deployment.
+
+**The `description` field is a planner prompt, not just a label.** Use it to guide what the mapper focuses on. Include:
+- What aspects of the infrastructure to prioritize
+- Specific areas to map deeply (CI/CD, credential handling, Docker architecture, IAM, etc.)
+- The goal of the mapping (security analysis, compliance review, etc.)
 
 **Repositories:**
 ```
 create_mapping_run(
-  description="Map ACME Corp GitHub repositories",
-  repositories='["https://github.com/acme/api-service", "https://github.com/acme/infra"]',
-  credentials_profile="github"
+  description="Map the ACME API service repository with focus on: 1) CI/CD pipeline infrastructure — GitHub Actions workflows, secrets, OIDC federation 2) Authentication and credential handling — how API keys and tokens flow between services 3) Docker container configuration — Dockerfiles, compose files, runtime security 4) Dependency tree with attention to supply chain risk surface 5) API endpoints and authentication boundaries",
+  repositories='["https://github.com/acme/api-service"]',
+  credentials_profile="default"
 )
 ```
 
 **Cloud account:**
 ```
 create_mapping_run(
-  description="Map AWS production account",
+  description="Map AWS production account focusing on: IAM role relationships and trust policies, S3 bucket access patterns, Lambda execution roles, VPC and security group configuration, cross-service credential chains",
   cloud_accounts='[{"provider": "aws", "account_id": "123456789012", "regions": ["us-east-1", "us-west-2"]}]',
   credentials_profile="default"
 )
@@ -67,7 +65,7 @@ create_mapping_run(
 **Mixed scope:**
 ```
 create_mapping_run(
-  description="Map full ACME infrastructure",
+  description="Full infrastructure mapping of ACME — map both code and cloud infrastructure, focus on how deployment pipelines connect to production resources, credential flow from CI/CD to cloud services, and trust boundaries between environments",
   repositories='["https://github.com/acme/infra", "https://github.com/acme/api"]',
   cloud_accounts='[{"provider": "aws", "account_id": "123456789012", "regions": ["us-east-1"]}]',
   domains='["acme.com"]',
@@ -108,33 +106,22 @@ Once status is `completed`, find the graph:
 ```
 list_repositories()        → find the repo (match source_graph_id to the run, or look for the newest)
 list_branches(repo_id)     → get the main branch
-get_branch(repo_id, branch_id)  → see node/edge counts
+get_branch(branch_id)  → see node/edge counts
 search_nodes(repo_id, "...")     → find resources by name substring (use short terms like "postgres", not phrases)
 ```
 
 Report the final graph stats to the user (node count, edge count).
 
-### Step 6 — Next steps (suggest to user)
+### Step 6 — Next steps
 
-After mapping completes, suggest these follow-up actions:
+After mapping completes, suggest:
 
-1. **Run attack path analysis** to discover attack paths:
-   ```
-   run_inference(branch_id)
-   ```
-
-2. **Triage attack paths** — review and validate findings:
-   ```
-   list_attack_paths()
-   ```
-
-3. **Match threat model templates** — check for known attack patterns:
-   ```
-   oracle_load_branch(branch_id)
-   oracle_tm_list_templates()
-   oracle_tm_load_template("iam-privilege-escalation")
-   oracle_tm_match_refine()
-   ```
+- "Want to explore what was mapped?" → `/explore` to browse entry points, crown jewels, security boundaries
+- "Want to find attack paths?" → `/research` for proactive discovery with threat model templates
+- "Want to investigate a specific CVE or finding?" → `/investigate` with the finding
+- "Want to process scanner results against this graph?" → `/triage-report` with scanner JSON
+- "Want to run JEPA inference?" → `run_inference(branch_id)` to discover paths automatically, then `/review-paths` to review results
+- "Want to learn how to read the model's signals?" → `/tutorial`
 
 ## Error handling
 
