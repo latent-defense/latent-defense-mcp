@@ -26,7 +26,19 @@ def _sanitize_error(text: str) -> str:
 
 
 class McpApiError(Exception):
-    """Raised with a user-actionable error message."""
+    """Raised with a user-actionable error message.
+
+    ``status`` carries the originating HTTP status code (``None`` when the
+    error did not come from an HTTP response). Callers should branch on
+    ``status`` — e.g. an expected 404 on a best-effort leg — rather than
+    matching the message text, which changes when :func:`handle_response`
+    prefers the structured error envelope over the per-status message
+    (review: claude[bot], LD-2255).
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 # ---------------------------------------------------------------------------
@@ -73,11 +85,22 @@ TOOL_SCOPES: dict[str, str] = {
     "delete_inference_schedule": "inference:configure",
     # Attack path triage
     "list_attack_paths": "triage:read",
+    "paths_through_node": "triage:read",
     "get_attack_path": "triage:read",
     "update_path_status": "triage:write",
     "validate_path": "triage:write",
-    "escalate_path": "triage:write",
+    "dismiss_path": "triage:write",
+    "undismiss_path": "triage:write",
+    "bulk_update_paths": "triage:write",
+    "override_risk_score": "triage:write",
+    "clear_risk_override": "triage:write",
+    "add_path_comment": "triage:write",
+    "edit_path_comment": "triage:write",
+    "list_path_history": "triage:read",
+    "list_path_comments": "triage:read",
     "triage_stats": "triage:read",
+    "get_triage_config": "triage:read",
+    "get_classification_stats": "triage:read",
     # Webhooks
     "register_webhook": "webhooks",
     "list_webhooks": "webhooks",
@@ -161,10 +184,26 @@ def handle_response(
     """Check an HTTP response and raise McpApiError with actionable guidance.
 
     Prefers the structured error envelope (``{error: {code, message, hint}}``)
-    when present, falling back to per-status heuristics.
+    when present, falling back to per-status heuristics. Every raised error
+    carries the HTTP status on ``McpApiError.status`` so callers can branch on
+    the code (e.g. an expected 404) without matching message text — the raise
+    site (envelope vs per-status) no longer changes how a caller detects a 404.
     """
     if response.is_success:
         return
+    try:
+        _raise_for_response(response, tool_name=tool_name)
+    except McpApiError as e:
+        if e.status is None:
+            e.status = response.status_code
+        raise
+
+
+def _raise_for_response(
+    response: httpx.Response,
+    *,
+    tool_name: str | None = None,
+) -> None:
 
     portal_url = os.environ.get("LATENT_DEFENSE_URL", "https://portal.latentdefense.ai")
 

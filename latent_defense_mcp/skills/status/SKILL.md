@@ -74,7 +74,7 @@ Format as a compact dashboard. One section per area, 1-2 lines each. Highlight a
 
 **Security Posture**
 - `triage_stats` fields: `total`, `by_status` dict
-- Example: "47 paths total: 12 new, 5 acknowledged, 2 validating, 8 validated, 3 escalated, 10 ticketed, 7 closed"
+- Example: "47 paths total: 12 new, 5 acknowledged, 2 validating, 8 validated, 10 ticketed, 7 closed"
 - Flag `by_status.new > 0` as "N paths need triage"
 
 **Remediation**

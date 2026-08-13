@@ -1,13 +1,13 @@
 ---
 name: triage
-description: "Guided attack path triage queue. Review, validate, escalate, or dismiss attack paths discovered by inference."
+description: "Guided attack path triage queue. Review, validate, dismiss, or ticket attack paths discovered by inference."
 user-invocable: true
 disable-model-invocation: false
 ---
 
 # Triage — Attack Path Queue
 
-Work through the attack path triage queue. For each path: review the details, decide whether to validate it in a sandbox, acknowledge it, dismiss it, or escalate it to ticketing.
+Work through the attack path triage queue. For each path: review the details, decide whether to validate it in a sandbox, acknowledge it, dismiss it, or create a remediation ticket.
 
 ## Prerequisites
 
@@ -18,11 +18,16 @@ Work through the attack path triage queue. For each path: review the details, de
 
 | Tool | What it does |
 |------|-------------|
-| `list_attack_paths(status, min_risk_score, limit, offset)` | Query attack paths with optional filters |
+| `list_attack_paths(status, min_risk_score, limit, offset, order, repository_id, mitre_technique, source_detection_id)` | Query attack paths with optional filters |
 | `get_attack_path(path_id)` | Full path details: steps, MITRE mappings, risk score, difficulty |
 | `update_path_status(path_id, status, note)` | Change a path's triage status |
 | `validate_path(path_id)` | Dispatch to sandbox validation |
-| `escalate_path(path_id)` | Send a validated path to the ticketing system |
+| `dismiss_path(path_id, reason, note, expires_at)` | Dismiss a path as false positive with structured reason |
+| `bulk_update_paths(action, status_filter, repository_id, reason, note, limit)` | Apply acknowledge/dismiss/close to multiple matching paths |
+| `override_risk_score(path_id, risk_score, reason)` | Set a user risk score (0–100); model score preserved alongside |
+| `clear_risk_override(path_id)` | Remove user score override; sorting reverts to model score |
+| `add_path_comment(path_id, author, text)` | Attach an investigation note or decision to a path |
+| `list_path_history(path_id)` | Unified timeline: status changes, score changes, comments |
 | `get_validation_status(run_id)` | Check sandbox validation progress |
 | `triage_stats(repository_id)` | Aggregate counts by status |
 
@@ -66,7 +71,6 @@ Call `list_attack_paths(status="new", limit=20)` and `triage_stats()` in paralle
     "acknowledged": 5,
     "validating": 2,
     "validated": 8,
-    "escalated": 3,
     "ticketed": 10,
     "closed": 7
   },
@@ -126,8 +130,10 @@ Returns the full `TriagePath` object:
 |--------|----------|-------------|
 | **Validate** | `validate_path(path_id)` | Path looks plausible, send to sandbox for real exploit attempt |
 | **Acknowledge** | `update_path_status(path_id, "acknowledged")` | Path is real but not urgent, mark as seen |
-| **Dismiss** | `update_path_status(path_id, "false_positive", note="...")` | False positive or acceptable risk. Ask for a reason. |
-| **Escalate** | `escalate_path(path_id)` | Path is validated and needs remediation NOW |
+| **Dismiss** | `dismiss_path(path_id, reason="...", note="...")` | False positive or acceptable risk. Ask for a reason. |
+| **Override score** | `override_risk_score(path_id, risk_score, reason)` | User believes risk is higher/lower than model scored |
+| **Comment** | `add_path_comment(path_id, author, text)` | Annotate investigation notes or decisions |
+| **Ticket** | (use `/remediate`) | Path is validated and needs a remediation ticket |
 | **Skip** | (no call) | Move to next path without changing status |
 
 ### Step 3 — Monitor validation
@@ -164,7 +170,7 @@ When the user chooses **Validate**:
 
 5. When `status` is `failed`: "Validation failed (sandbox error). The path remains in 'validating' and the reconciler will retry automatically."
 
-6. After validation completes, ask the user whether to **escalate** the path to ticketing or **continue** to the next path.
+6. After validation completes, ask the user whether to **create a remediation ticket** (→ `/remediate`) or **continue** to the next path.
 
 ### Step 4 — Track progress
 
@@ -175,7 +181,7 @@ When the queue is empty or the user wants to stop, show a session summary:
 - Validated: N (M exploitable, K dead end)
 - Acknowledged: N
 - Dismissed: N
-- Escalated: N
+- Ticketed: N
 - Skipped: N
 
 ### Next steps
@@ -197,7 +203,7 @@ After completing triage:
 - **60–80**: little resistance. Most hops accelerate. High priority.
 - **80–100**: almost no resistance across the path.
 
-A score of 15 means the infrastructure is well defended on this path. If all paths in the queue score under 20, the conclusion is "well defended" — dismiss or acknowledge these paths rather than escalating. Focus attention on paths scoring 40+.
+A score of 15 means the infrastructure is well defended on this path. If all paths in the queue score under 20, the conclusion is "well defended" — dismiss or acknowledge these paths. Focus attention on paths scoring 40+.
 
 **Difficulty labels** (trivial/easy/medium/hard/extreme) describe attacker economics, not skill requirements. "Easy" means an attacker (human or AI) would continue along this path rather than pivoting. "Extreme" means the structural resistance makes pivoting more rational.
 
@@ -230,4 +236,5 @@ Validation dispatches to sandbox validation, which attempts the exploit steps an
 | 404 Not Found on `get_attack_path` | Path was deleted or ID is wrong | Re-query with `list_attack_paths` |
 | 422 on `update_path_status` | Invalid status transition (e.g. `new` → `ticketed` without validation) | Follow the status machine: new → acknowledged/validating/closed |
 | 502 on `validate_path` | Validator service unreachable | Check deployment health; the reconciler will retry automatically |
-| 502 on `escalate_path` | Ticketing service unreachable | Retry later or create ticket manually via `/remediate` |
+| 422 on `dismiss_path` | Path not in acknowledged or validated state | Check current status with `get_attack_path`; transition first if needed |
+| 422 on `override_risk_score` | risk_score outside 0–100 | Clamp value to [0, 100] before calling |

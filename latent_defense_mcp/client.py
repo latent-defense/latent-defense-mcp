@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import httpx
 
 from .auth import TokenManager
+
+log = logging.getLogger("latent-defense-mcp")
 
 _token_manager: TokenManager | None = None
 
@@ -14,11 +17,9 @@ _token_manager: TokenManager | None = None
 def _base_url() -> str:
     url = os.environ.get("LATENT_DEFENSE_URL")
     if not url:
-        import sys
-        print(
-            "Warning: LATENT_DEFENSE_URL is not set. "
+        log.warning(
+            "LATENT_DEFENSE_URL is not set. "
             "Set it in the 'env' block of .mcp.json to point to your deployment.",
-            file=sys.stderr,
         )
         return "https://portal.latentdefense.ai"
     return url

@@ -6,7 +6,7 @@ MCP server that connects [Claude Code](https://docs.anthropic.com/en/docs/claude
 
 ```bash
 # 1. Install
-pip install git+https://github.com/latent-defense/latent-defense-mcp.git
+pip install git+https://github.com/latent-defense/mcp-server.git
 
 # 2. Scaffold config and skills into your project
 cd your-project
@@ -44,7 +44,7 @@ Alternatively, type `/setup <url>` for a guided walkthrough that handles configu
 #### 1. Install
 
 ```bash
-pip install git+https://github.com/latent-defense/latent-defense-mcp.git
+pip install git+https://github.com/latent-defense/mcp-server.git
 ```
 
 #### 2. Scaffold config and skills
@@ -303,7 +303,6 @@ Use difficulty as a ranking signal to prioritize paths relative to each other wi
 | `get_attack_path` | Get full path details with MITRE ATT&CK mappings and energy breakdown |
 | `update_path_status` | Update triage status |
 | `validate_path` | Dispatch for sandbox validation |
-| `escalate_path` | Escalate to ticketing |
 | `triage_stats` | Counts by status, severity, repository |
 | `get_validation_status` | Check sandbox validation progress |
 

@@ -7,7 +7,7 @@ disable-model-invocation: false
 
 # Review Paths — Attack Path Review
 
-Review attack paths that have been discovered by inference or submitted through research. Understand what the risk scores mean in context, see per-hop energy breakdowns, and take action (acknowledge, dismiss, escalate, validate).
+Review attack paths that have been discovered by inference or submitted through research. Understand what the risk scores mean in context, see per-hop energy breakdowns, and take action (acknowledge, dismiss, validate, ticket).
 
 ## Prerequisites
 
@@ -19,7 +19,9 @@ All tools prefixed with `mcp__latent-defense__`. Use ToolSearch to load schemas 
 
 **Path listing**: `list_attack_paths(status, min_risk_score, limit, offset, summary)`, `triage_stats(repository_id)`
 **Path detail**: `get_attack_path(path_id)`
-**Path actions**: `update_path_status(path_id, status, note)`, `validate_path(path_id)`, `escalate_path(path_id)`
+**Path actions**: `update_path_status(path_id, status, note)`, `validate_path(path_id)`, `dismiss_path(path_id, reason, note, expires_at)`
+**Score overrides**: `override_risk_score(path_id, risk_score, reason)`, `clear_risk_override(path_id)`
+**Comments + history**: `add_path_comment(path_id, author, text)`, `list_path_history(path_id)`
 **Validation monitoring**: `get_validation_status(run_id)` — check sandbox validation progress
 **Graph context**: `oracle_load_branch`, `oracle_wait_for_load`, `oracle_get_node`
 
@@ -32,7 +34,7 @@ triage_stats()
 ```
 
 Show the user:
-- Total paths by status (new, acknowledged, validated, escalated, ticketed, closed, false_positive)
+- Total paths by status (new, acknowledged, validated, ticketed, closed, false_positive)
 - Severity distribution
 - Paths by repository
 
@@ -71,8 +73,8 @@ Based on the review, the user can:
 |--------|------|---------|
 | **Acknowledge** | "I've seen this, will investigate" | `update_path_status(path_id, "acknowledged")` |
 | **Validate** | "Send to sandbox for exploit testing" | `validate_path(path_id)` — takes 5-15 min. Poll `get_validation_status(run_id)` every 30-60s for progress. |
-| **Escalate** | "Forward to ticketing" | `escalate_path(path_id)` |
-| **Dismiss** | "This is a false positive or accepted risk" | `update_path_status(path_id, "false_positive", note="reason")` |
+| **Dismiss** | "This is a false positive or accepted risk" | `dismiss_path(path_id, reason="risk_accepted", note="reason")` |
+| **Ticket** | "Create a remediation ticket" | Use `/remediate` |
 | **Close** | "This has been remediated" | `update_path_status(path_id, "closed", note="what was fixed")` |
 
 ## Step 4 — Deeper investigation

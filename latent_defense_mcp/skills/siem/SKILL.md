@@ -28,7 +28,7 @@ All tools prefixed with `mcp__latent-defense__`. Use ToolSearch to load schemas 
 | `validate_webhook_template(template, sample_event_type)` | Dry-validate a Jinja template |
 | `delete_webhook(webhook_id)` | Remove a webhook |
 | `list_attack_paths(status, limit, summary)` | Check that paths exist to export |
-| `triage_stats()` | Verify paths are in validated/escalated status |
+| `triage_stats()` | Verify paths are in validated/ticketed status |
 
 ---
 
@@ -39,7 +39,7 @@ triage_stats()
 list_attack_paths(status="validated", limit=5, summary=true)
 ```
 
-Verify that validated or escalated paths exist. If none: "No validated attack paths to export. Run `/research` or `/triage` first to discover and validate paths, then come back."
+Verify that validated or ticketed paths exist. If none: "No validated attack paths to export. Run `/research` or `/triage` first to discover and validate paths, then come back."
 
 ## Step 2 — Choose the approach
 
@@ -57,7 +57,7 @@ Ask the user which approach fits their SIEM:
 ### What it does
 
 A standalone Python script that:
-1. Polls the triage API for validated/escalated attack paths
+1. Polls the triage API for validated/ticketed attack paths
 2. Converts each path to CEF (Common Event Format)
 3. Sends via syslog (UDP or TCP)
 4. Tracks sent paths to avoid duplicates (idempotent)
@@ -76,7 +76,7 @@ Share this script with the user. It's a complete, self-contained connector:
 #!/usr/bin/env python3
 """Latent Defense -> SIEM connector.
 
-Polls for validated/escalated attack paths, converts to CEF, sends via syslog.
+Polls for validated/ticketed attack paths, converts to CEF, sends via syslog.
 Requires: Python 3.9+, requests (pip install requests).
 """
 
@@ -114,7 +114,7 @@ def save_state(state):
     tmp.rename(STATE_FILE)
 
 def fetch_paths():
-    resp = SESSION.get(f"{PORTAL_URL}/api/triage/paths", params={"status": "validated,escalated"}, timeout=30)
+    resp = SESSION.get(f"{PORTAL_URL}/api/triage/paths", params={"status": "validated,ticketed"}, timeout=30)
     resp.raise_for_status()
     return resp.json().get("items", [])
 
@@ -206,13 +206,13 @@ Show the user the rendered output. If it has errors, fix the template and re-val
 ```
 register_webhook(
   url="https://siem.internal.example.com/api/events",
-  events='["new_path", "validation_complete", "path_escalated_to_ticketing"]',
+  events='["new_path", "validation_complete", "status_change"]',
   template="<the validated template>",
   secret="<user's HMAC secret>"
 )
 ```
 
-Available events: `new_path`, `status_change`, `validation_complete`, `path_acknowledged`, `path_dispatched_to_validator`, `path_escalated_to_ticketing`, `severity_change`.
+Available events: `new_path`, `status_change`, `validation_complete`, `path_acknowledged`, `path_dispatched_to_validator`, `severity_change`.
 
 ### Step D — Test the webhook
 

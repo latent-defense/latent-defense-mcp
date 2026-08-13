@@ -156,7 +156,6 @@ If no webhooks exist, set one up:
    - `validation_complete` — sandbox validation finished
    - `path_acknowledged` — a path was acknowledged
    - `path_dispatched_to_validator` — a path was sent for sandbox validation
-   - `path_escalated_to_ticketing` — a path was escalated to the ticketing system
    - `severity_change` — a path's severity changed
 
 3. **Optionally customize the payload** with a Jinja2 template. Default is the full event JSON. Template variables:

@@ -27,40 +27,49 @@ Present the user with these options. Use AskUserQuestion with a clear question a
 4. **Investigate a finding** — "I have a specific CVE, alert, or detection to investigate."
    → `/investigate` with their finding
 
-5. **Triage a scanner report** — "I have scanner output (Trivy, Checkov, etc.) to process against my graph."
+5. **Triage scanner findings at scale** — "I have scanner output and want structural triage — group by remediation action, investigate against the graph, produce reports for my team."
+   → `/triage-findings`
+
+6. **Triage a scanner report** — "I have scanner output (Trivy, Checkov, etc.) to process against my graph and get a full triage table."
    → `/triage-report` with the path to their scanner output
 
-6. **Find attack paths** — "Proactively discover attack paths I don't know about yet."
+7. **Find attack paths** — "Proactively discover attack paths I don't know about yet."
    → `/research`
 
-7. **Review existing paths** — "Review attack paths already in my triage queue."
+8. **Review existing paths** — "Review attack paths already in my triage queue."
    → `/review-paths`
 
-8. **Re-run inference** — "Re-run the JEPA model on my graph (after updates, remapping, or remediation)."
-   → `/rerun-inference`
+9. **Assess a CVE** — "How exposed am I to a specific CVE?"
+   → Use the `assess_cve` prompt with their CVE ID
 
-9. **Compare graph snapshots** — "See what changed between two points in time."
-   → `/diff`
+10. **Find chokepoints** — "Which nodes should I harden to eliminate the most attack paths?"
+    → Use the `chokepoint_report` prompt
 
-10. **Map new infrastructure** — "Map a repository, cloud account, or Kubernetes cluster."
+11. **Re-run inference** — "Re-run the JEPA model on my graph (after updates, remapping, or remediation)."
+    → `/rerun-inference`
+
+12. **Compare graph snapshots** — "See what changed between two points in time."
+    → `/diff`
+
+13. **Map new infrastructure** — "Map a repository, cloud account, or Kubernetes cluster."
     → `/map`
 
-11. **Build an integration** — "Build an automation, set up webhooks, or integrate the API."
+14. **Build an integration** — "Build an automation, set up webhooks, or integrate the API."
     → `/build`
 
-12. **Set up SIEM integration** — "Export attack paths to my SIEM (Splunk, Sentinel, Elastic, QRadar)."
+15. **Set up SIEM integration** — "Export attack paths to my SIEM (Splunk, Sentinel, Elastic, QRadar)."
     → `/siem`
 
-13. **Set up monitoring** — "Configure recurring scans, inference schedules, or alert webhooks."
+16. **Set up monitoring** — "Configure recurring scans, inference schedules, or alert webhooks."
     → `/monitor`
 
-13. **Create remediation tickets** — "Create tickets for validated attack paths."
+17. **Create remediation tickets** — "Create tickets for validated attack paths."
     → `/remediate`
 
-14. **Check deployment health** — "Quick health check of all services."
+18. **Check deployment health** — "Quick health check of all services."
     → `/status`
 
-15. **Understand the world model** — "I want a reference on how energy, risk scores, and threat models work."
+19. **Understand the world model** — "I want a reference on how energy, risk scores, and threat models work."
     → `/world-model-guide`
 
 If the user describes something that doesn't fit these categories, help them figure out which skill is closest. If they're unsure, recommend `/tutorial` for new users or `/my-data` for returning users who want to see what they have.

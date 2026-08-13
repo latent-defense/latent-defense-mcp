@@ -73,8 +73,8 @@ Build the full map:
 ```
 fastmcp → graph: fastmcp>=3.3.1 (package) [5 CVEs]
 litellm → graph: litellm==1.83.10 (package) [3 CVEs]
-Dockerfile → graph: archipelago-environment-container (container) [4 checks]
-tools.py → graph: mercor-rls-code-execution (service) [2 code findings]
+Dockerfile → graph: app-container (container) [4 checks]
+tools.py → graph: code-execution-service (service) [2 code findings]
 authlib → NOT IN GRAPH [1 CVE]
 pillow → graph: Pillow>=12.1.0 (package) [12 CVEs]
 ```
@@ -84,7 +84,7 @@ pillow → graph: Pillow>=12.1.0 (package) [12 CVEs]
 Group all findings by which graph node they map to:
 
 ```
-CLUSTER: mercor-rls-code-execution (8 findings)
+CLUSTER: code-execution-service (8 findings)
   Trivy: CVE-2026-32871 (fastmcp), CVE-2026-49468 (litellm), CVE-2026-27962 (authlib)
   Bandit: B102 (exec), B307 (eval)
   Semgrep: sqlalchemy.text raw SQL
@@ -201,7 +201,7 @@ Output a comprehensive table covering EVERY finding. Group by resolution categor
 
 | Chain | Template | Coverage | Risk Score | Affected Components | Action |
 |-------|----------|----------|------------|-------------------|--------|
-| lifecycle hook → creds | custom | 85% | 7.71/100 | run_lifecycle_hook | Restrict shell execution |
+| lifecycle hook → creds | custom | 85% | 42/100 | post_deploy_hook | Restrict shell execution |
 
 ### UPDATE RECOMMENDED ([N])
 

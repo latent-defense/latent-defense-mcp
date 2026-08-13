@@ -1,13 +1,13 @@
 ---
 name: triage
-description: "Guided attack path triage queue. Review, validate, escalate, or dismiss attack paths discovered by inference."
+description: "Guided attack path triage queue. Review, validate, dismiss, or ticket attack paths discovered by inference."
 user-invocable: true
 disable-model-invocation: false
 ---
 
 # Triage — Attack Path Queue
 
-Work through the attack path triage queue. For each path: review the details, decide whether to validate it in a sandbox, acknowledge it, dismiss it, or escalate it to ticketing.
+Work through the attack path triage queue. For each path: review the details, decide whether to validate it in a sandbox, acknowledge it, dismiss it, or create a remediation ticket.
 
 ## Prerequisites
 
@@ -18,13 +18,32 @@ Work through the attack path triage queue. For each path: review the details, de
 
 | Tool | What it does |
 |------|-------------|
-| `list_attack_paths(status, min_risk_score, limit, offset)` | Query attack paths with optional filters |
-| `get_attack_path(path_id)` | Full path details: steps, MITRE mappings, risk score, difficulty |
+| `list_attack_paths(status, min_risk_score, limit, offset, order, repository_id, mitre_technique, source_detection_id, rescored, rescored_window_hours)` | Query attack paths with optional filters. Use `rescored=True` for re-scored queue. Use `status="superseded"` for system-dismissed paths. |
+| `paths_through_node(node_id, status, min_risk_score, ...)` | Find attack paths that flow through a specific node (chokepoint analysis, CVE exposure) |
+| `get_attack_path(path_id)` | Full path details: steps, MITRE mappings, risk score, difficulty, reassessment history |
 | `update_path_status(path_id, status, note)` | Change a path's triage status |
 | `validate_path(path_id)` | Dispatch to sandbox validation |
-| `escalate_path(path_id)` | Send a validated path to the ticketing system |
+| `dismiss_path(path_id, reason, note, expires_at)` | Dismiss a path as false positive with structured reason. Not for superseded paths. |
+| `undismiss_path(path_id, reason, note)` | Reopen a dismissed path back into the queue |
+| `bulk_update_paths(action, status_filter, repository_id, reason, note, limit)` | Apply acknowledge/dismiss/close to multiple matching paths |
+| `override_risk_score(path_id, risk_score, reason)` | Set a user risk score (0–100); model score preserved alongside |
+| `clear_risk_override(path_id)` | Remove user score override; sorting reverts to model score |
+| `add_path_comment(path_id, text, author, parent_comment_id, parent_event_id)` | Add a comment (threaded — use parent_comment_id to reply). Agent attribution automatic. |
+| `edit_path_comment(path_id, comment_id, text)` | Edit a comment (append-only revision). Server enforces author-only. |
+| `list_path_comments(path_id)` | All comments with threading (parent_comment_id, parent_event_id), author_kind, agent_name |
+| `list_path_history(path_id)` | Unified timeline: status changes, score changes, comments |
 | `get_validation_status(run_id)` | Check sandbox validation progress |
 | `triage_stats(repository_id)` | Aggregate counts by status |
+| `get_triage_config()` | Display config (rescore_display_threshold) — for RE-SCORED badge logic |
+| `get_classification_stats(repository_id)` | Classification breakdown |
+
+## Prompts
+
+| Prompt | What it does |
+|--------|-------------|
+| `triage_queue_review(repository_id, min_risk_score, status)` | Interactive triage queue walkthrough |
+| `assess_cve(cve_id, repository_id)` | Assess exposure of a CVE across the infrastructure graph |
+| `chokepoint_report(repository_id, min_paths)` | Identify chokepoint nodes where many attack paths converge |
 
 ## Workflow
 
@@ -32,52 +51,11 @@ Work through the attack path triage queue. For each path: review the details, de
 
 Call `list_attack_paths(status="new", limit=20)` and `triage_stats()` in parallel.
 
-`list_attack_paths` returns:
-```json
-{
-  "items": [
-    {
-      "path_id": "path_abc123",
-      "entry_node": "public-api-gateway",
-      "target_node": "production-database",
-      "step_count": 4,
-      "risk_score": 82.5,
-      "difficulty": "easy",
-      "mitre_techniques": ["T1190", "T1078", "T1552"],
-      "status": "new",
-      "source": "unconstrained",
-      "repository_id": "repo_xyz",
-      "branch_id": "branch_main",
-      "created_at": "2026-06-20T14:30:00Z"
-    }
-  ],
-  "total": 12,
-  "limit": 20,
-  "offset": 0
-}
-```
-
-`triage_stats` returns:
-```json
-{
-  "total": 47,
-  "by_status": {
-    "new": 12,
-    "acknowledged": 5,
-    "validating": 2,
-    "validated": 8,
-    "escalated": 3,
-    "ticketed": 10,
-    "closed": 7
-  },
-  "by_severity": { ... },
-  "by_repository": { ... }
-}
-```
-
 Present a summary: "12 new paths, 47 total. 8 validated, 10 ticketed, 7 closed."
 
 Sort the queue by `risk_score` descending (highest risk first).
+
+Check for re-scored paths: `list_attack_paths(rescored=True)`. If any, note "N findings were recently re-scored" and check `get_triage_config()` for the display threshold.
 
 ### Step 2 — Walk each path
 
@@ -85,127 +63,70 @@ For each path in the queue (highest `risk_score` first):
 
 **2a. Load full details.** Call `get_attack_path(path_id)`.
 
-Returns the full `TriagePath` object:
-```json
-{
-  "path_id": "path_abc123",
-  "entry_node": "public-api-gateway",
-  "target_node": "production-database",
-  "steps": [
-    {
-      "source_node": "public-api-gateway",
-      "target_node": "auth-service",
-      "edge_type": "exploits",
-      "tactic": "initial_access",
-      "technique": "T1190",
-      "description": "Exploit public-facing application"
-    }
-  ],
-  "step_count": 4,
-  "risk_score": 82.5,
-  "difficulty": "easy",
-  "mitre_techniques": ["T1190", "T1078", "T1552", "T1210"],
-  "status": "new",
-  "validation_run_id": null,
-  "validation_verdict": null,
-  "source": "unconstrained",
-  "repository_id": "repo_xyz",
-  "branch_id": "branch_main"
-}
-```
-
 **2b. Present the path.** Show:
 - Entry → Target with step count
-- Risk score and difficulty (see "How to read difficulty scores" below)
+- Risk score and difficulty
 - MITRE techniques (list technique IDs with brief names)
 - Each step: source → target, edge type, tactic/technique, description
+- Reassessment history if present (risk_before → risk_after, applied_at)
 
 **2c. Ask the user what to do.**
 
 | Action | Tool call | When to use |
 |--------|----------|-------------|
-| **Validate** | `validate_path(path_id)` | Path looks plausible, send to sandbox for real exploit attempt |
-| **Acknowledge** | `update_path_status(path_id, "acknowledged")` | Path is real but not urgent, mark as seen |
-| **Dismiss** | `update_path_status(path_id, "false_positive", note="...")` | False positive or acceptable risk. Ask for a reason. |
-| **Escalate** | `escalate_path(path_id)` | Path is validated and needs remediation NOW |
-| **Skip** | (no call) | Move to next path without changing status |
+| **Validate** | `validate_path(path_id)` | Path looks plausible, send to sandbox |
+| **Acknowledge** | `update_path_status(path_id, "acknowledged")` | Path is real but not urgent |
+| **Dismiss** | `dismiss_path(path_id, reason="...", note="...")` | False positive or accepted risk |
+| **Undismiss** | `undismiss_path(path_id, reason="...")` | Reopen a dismissed path |
+| **Override score** | `override_risk_score(path_id, risk_score, reason)` | User believes risk differs |
+| **Comment** | `add_path_comment(path_id, text="...")` | Annotate investigation notes |
+| **Reply** | `add_path_comment(path_id, text="...", parent_comment_id="...")` | Reply to an existing comment |
+| **Ticket** | (use `/remediate`) | Path is validated and needs remediation |
+| **Skip** | (no call) | Move to next path |
 
 ### Step 3 — Monitor validation
 
 When the user chooses **Validate**:
 
-1. Call `validate_path(path_id)`. Returns the updated `TriagePath` with `status: "validating"` and `validation_run_id`.
-
-2. Tell the user: "Validation dispatched. This dispatches to sandbox validation, which attempts the exploit steps and independently verifies the result. This typically takes 5-15 minutes."
-
+1. Call `validate_path(path_id)`. Returns `status: "validating"` and `validation_run_id`.
+2. Tell the user: "Validation dispatched. Takes 5-15 minutes."
 3. Poll `get_validation_status(run_id)` every 45 seconds.
-
-   `get_validation_status` returns:
-   ```json
-   {
-     "run_id": "val_run_abc123",
-     "status": "running",
-     "total_steps": 4,
-     "steps_completed": 2,
-     "steps_exploitable": 1,
-     "steps_dead_end": 1,
-     "current_step": 3,
-     "current_phase": "exploit_attempt"
-   }
-   ```
-
-   Status progression: `pending` → `running` → `completed` | `failed`
-
-   While running, report: "Step 2/4 completed (1 exploitable, 1 dead end). Currently on step 3, exploit agent active."
-
-4. When `status` is `completed`:
-   - If `steps_exploitable > 0`: "Validation confirmed: N of M steps are exploitable. The path is real." The triage service automatically moves the path to `validated`.
-   - If `steps_dead_end == total_steps`: "All steps are dead ends. The path is not currently exploitable." The path moves to `validated` with a dead-end verdict.
-
-5. When `status` is `failed`: "Validation failed (sandbox error). The path remains in 'validating' and the reconciler will retry automatically."
-
-6. After validation completes, ask the user whether to **escalate** the path to ticketing or **continue** to the next path.
+4. When completed: report exploitable/dead-end counts.
+5. After validation, ask whether to create a remediation ticket or continue.
 
 ### Step 4 — Track progress
 
-After each action, show the remaining count: "11 new paths remaining."
+After each action, show the remaining count.
 
-When the queue is empty or the user wants to stop, show a session summary:
-- Paths reviewed: N
-- Validated: N (M exploitable, K dead end)
-- Acknowledged: N
-- Dismissed: N
-- Escalated: N
-- Skipped: N
+When done, show a session summary: paths reviewed, validated, acknowledged, dismissed, ticketed, skipped.
 
-### Next steps
+### Superseded paths
 
-After completing triage:
-- "Want to create remediation tickets?" → `/remediate`
-- "Want to investigate a specific path deeper?" → `/investigate` with the path's entry node or target
-- "Want to explore the graph around a finding?" → `/explore`
-- "Want to find more paths proactively?" → `/research`
-- "Want to set up monitoring for new paths?" → `/monitor`
-- "Want to process scanner output against this graph?" → `/triage-report`
+Paths with `status=superseded` were eliminated by re-scoring (system-dismissed). They should NOT be acted on with `dismiss_path` (that's for operator dismissals). View them with `list_attack_paths(status="superseded")` — they appear in the Dismissed tab, distinct from operator dismissals.
 
 ## How to read risk scores and difficulty
 
-**Risk scores are 0–100** (momentum model). They integrate per-hop energy along the path. The bands have real meaning:
-- **0–20**: strong structural resistance. Most hops brake. Infrastructure is well-defended here.
-- **20–40**: moderate resistance. Mixed signal — investigate what's braking.
-- **40–60**: low resistance. Multiple accelerating hops. Deserves attention.
-- **60–80**: little resistance. Most hops accelerate. High priority.
-- **80–100**: almost no resistance across the path.
+**Risk scores are 0–100** (momentum model). Bands:
+- **0–20**: strong structural resistance. Well-defended.
+- **20–40**: moderate resistance. Mixed signal.
+- **40–60**: low resistance. Deserves attention.
+- **60–80**: little resistance. High priority.
+- **80–100**: almost no resistance.
 
-A score of 15 means the infrastructure is well defended on this path. If all paths in the queue score under 20, the conclusion is "well defended" — dismiss or acknowledge these paths rather than escalating. Focus attention on paths scoring 40+.
+**Severity labels** (canonical bands, LD-2187/2310):
+- Critical: 80+
+- High: 61–79
+- Medium: 41–60
+- Low: 21–40
+- Info: 0–20
 
-**Difficulty labels** (trivial/easy/medium/hard/extreme) describe attacker economics, not skill requirements. "Easy" means an attacker (human or AI) would continue along this path rather than pivoting. "Extreme" means the structural resistance makes pivoting more rational.
+**Difficulty labels** (trivial/easy/medium/hard/extreme) describe attacker economics, not skill.
 
-**Per-hop energy** (visible in the full path report): negative = accelerating (low resistance), positive = braking (control detected). When you see braking energy, the path description often identifies the specific control.
+**Per-hop energy**: negative = accelerating (low resistance), positive = braking (control detected). When you see braking energy, the path description often identifies the specific control.
 
 ## How to read MITRE techniques
 
-Common techniques you'll see in attack paths:
+Common techniques in attack paths:
 
 | ID | Name | Category |
 |----|------|----------|
@@ -222,12 +143,33 @@ Full mapping at https://attack.mitre.org/techniques/enterprise/.
 
 Validation dispatches to sandbox validation, which attempts the exploit steps and independently verifies the result. Each step runs in an isolated sandbox container with controlled egress. The verdict for each step is one of: `approved` (exploit confirmed), `rejected` (could not reproduce), or `dead_end` (step is not feasible).
 
+## Next steps
+
+After completing triage:
+- "Want to create remediation tickets?" → `/remediate`
+- "Want to investigate a specific path deeper?" → `/investigate` with the path's entry node or target
+- "Want to explore the graph around a finding?" → `/explore`
+- "Want to find more paths proactively?" → `/research`
+- "Want to process scanner output against this graph?" → `/triage-report`
+
 ## Error handling
 
 | Error | Cause | Fix |
 |-------|-------|-----|
 | 401 Unauthorized | API key invalid | Regenerate in portal |
-| 404 Not Found on `get_attack_path` | Path was deleted or ID is wrong | Re-query with `list_attack_paths` |
-| 422 on `update_path_status` | Invalid status transition (e.g. `new` → `ticketed` without validation) | Follow the status machine: new → acknowledged/validating/closed |
-| 502 on `validate_path` | Validator service unreachable | Check deployment health; the reconciler will retry automatically |
-| 502 on `escalate_path` | Ticketing service unreachable | Retry later or create ticket manually via `/remediate` |
+| 404 Not Found | Path deleted or wrong ID | Re-query with `list_attack_paths` |
+| 422 on `update_path_status` | Invalid status transition | Follow state machine: new → acknowledged/validating/closed |
+| 422 on `dismiss_path` | Path not in acknowledged/validated state | Transition first |
+| 422 on `override_risk_score` | risk_score outside 0–100 | Clamp to [0, 100] |
+| 403 on `edit_path_comment` | Not the comment author | Server-side author-only enforcement |
+| 502 on `validate_path` | Validator unreachable | Reconciler retries automatically |
+
+## Intentionally excluded from MCP
+
+| Capability | Reason |
+|---|---|
+| Evidence attachments (images) | Binary payload doesn't fit MCP; agents have graph/tool output |
+| Reassessment review (accept/reject) | ADR-002: re-grades auto-apply. Review queue deleted. |
+| Revalidation trigger | `require_internal` auth; use `validate_path` for initial validation |
+| Path graph snapshot | Visualization primitive; agents have `get_attack_path` + graph tools |
+| Comment deletion | Append-only model (portal doesn't support deletion either) |

@@ -97,7 +97,7 @@ If `configured` is `false`:
 
 ### Step 2 — Find remediation candidates
 
-Call `list_attack_paths(status="validated", limit=20)`. If empty, also try `list_attack_paths(status="escalated", limit=20)`.
+Call `list_attack_paths(status="validated", limit=20)`.
 
 Present each candidate:
 - Path ID, entry → target

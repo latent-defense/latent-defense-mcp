@@ -55,7 +55,7 @@ register_webhook(
 )
 ```
 
-**Events available**: `new_path`, `status_change`, `validation_complete`, `path_acknowledged`, `path_dispatched_to_validator`, `path_escalated_to_ticketing`, `severity_change`
+**Events available**: `new_path`, `status_change`, `validation_complete`, `path_acknowledged`, `path_dispatched_to_validator`, `severity_change`
 
 ### Pattern 2: Scheduled scanning + inference
 

@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import sys
+import time
+import uuid
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -14,11 +16,35 @@ import httpx
 
 from .auth import DeviceFlowPending
 from .client import get_token_manager, make_client, _base_url as get_base_url, _verify_ssl as get_verify_ssl
+from .energy_cache import EnergyGraphCache
 from .errors import McpApiError, handle_response
+from .telemetry import emit_mcp_call_event, fire_and_forget
 
 log = logging.getLogger("latent-defense-mcp")
 
-mcp = FastMCP(
+
+class InstrumentedFastMCP(FastMCP):
+    """FastMCP subclass that records one mcp_call_event per tool invocation."""
+
+    async def call_tool(self, name: str, arguments: dict) -> Any:
+        t0 = time.monotonic()
+        success = True
+        error_type: str | None = None
+        try:
+            return await super().call_tool(name, arguments)
+        except Exception as exc:
+            success = False
+            error_type = type(exc).__name__
+            raise
+        finally:
+            fire_and_forget(
+                emit_mcp_call_event(
+                    _http, name, (time.monotonic() - t0) * 1000, success, error_type
+                )
+            )
+
+
+mcp = InstrumentedFastMCP(
     "Latent Defense",
     instructions=(
         "Infrastructure security platform. Use these tools to explore "
@@ -36,6 +62,7 @@ _encoding_started_at: float | None = None
 _graph_loaded: bool = False
 _keepalive_task: object | None = None
 _refresh_lock = asyncio.Lock()
+_energy_cache: EnergyGraphCache | None = None
 
 VALID_NODE_TYPES = {
     "api_gateway",
@@ -1002,26 +1029,15 @@ async def delete_inference_schedule(schedule_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-async def list_attack_paths(
-    status: str = "",
-    min_risk_score: float = 0,
-    limit: int = 20,
-    offset: int = 0,
-    summary: bool = True,
-) -> str:
-    """List attack paths, optionally filtered by status or risk score.
-
-    Status values: new, acknowledged, validating, validated, escalated, ticketed, closed, failed, false_positive.
-    Set summary=False for full details including step narratives.
-    """
-    params: dict[str, Any] = {"limit": limit, "offset": offset}
-    if status:
-        params["status"] = status
-    if min_risk_score > 0:
-        params["min_risk_score"] = min_risk_score
-    result = await _get("/api/triage/paths", _tool="list_attack_paths", **params)
+def _project_path_list(
+    result: Any, *, summary: bool, limit: int, offset: int
+) -> Any:
+    """Shared post-processing for the `/api/triage/paths` list response used by
+    list_attack_paths and paths_through_node. When `summary` is on, projects
+    each path to a compact entry (path_id/status/risk_score/nodes/...); either
+    way stamps `has_more` for pagination."""
     if summary and isinstance(result, dict):
+        total = result.get("total", 0)
         items = result.get("items", result if isinstance(result, list) else [])
         if isinstance(items, list):
             summarized = []
@@ -1036,30 +1052,149 @@ async def list_attack_paths(
                     "constrained": "targeted_scan",
                     "detection": "detection_triggered",
                 }.get(source_raw, source_raw)
-                summarized.append(
-                    {
-                        "path_id": p.get("path_id"),
-                        "status": p.get("status"),
-                        "risk_score": p.get("risk_score"),
-                        "difficulty": p.get("difficulty"),
-                        "entry_node": p.get("entry_node"),
-                        "target_node": p.get("target_node"),
-                        "source": source_display,
-                        "n_steps": len(p.get("steps", [])),
-                        "branch_id": p.get("branch_id"),
-                        "created_at": p.get("created_at"),
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "path_id": p.get("path_id"),
+                    "status": p.get("status"),
+                    "risk_score": p.get("risk_score"),
+                    "difficulty": p.get("difficulty"),
+                    "entry_node": p.get("entry_node"),
+                    "target_node": p.get("target_node"),
+                    "source": source_display,
+                    "n_steps": len(p.get("steps", [])),
+                    "branch_id": p.get("branch_id"),
+                    "created_at": p.get("created_at"),
+                }
+                if p.get("user_risk_score") is not None:
+                    entry["user_risk_score"] = p["user_risk_score"]
+                    entry["user_risk_score_reason"] = p.get("user_risk_score_reason")
+                summarized.append(entry)
             result = {
                 "items": summarized,
-                "total": result.get("total", len(summarized)),
+                "total": total,
+                "has_more": offset + limit < total,
             }
-    return json.dumps(result)
+    elif isinstance(result, dict) and "total" in result:
+        result["has_more"] = offset + limit < result["total"]
+    return result
+
+
+@mcp.tool()
+async def list_attack_paths(
+    status: str = "",
+    min_risk_score: float = 0,
+    limit: int = 20,
+    offset: int = 0,
+    summary: bool = True,
+    order: str = "",
+    repository_id: str = "",
+    mitre_technique: str = "",
+    source_detection_id: str = "",
+    rescored: bool = False,
+    rescored_window_hours: int | None = None,
+) -> str:
+    """List attack paths, optionally filtered by status, risk score, repository, or MITRE technique.
+
+    Use ``status=superseded`` to list paths eliminated by re-scoring (system-dismissed,
+    not operator-dismissed). Superseded paths should not be acted on with dismiss_path.
+
+    Args:
+        status: Filter by status. Values: new, acknowledged, validating, validated, ticketed, closed, failed, false_positive, superseded.
+        min_risk_score: Only return paths with risk_score >= this value.
+        limit: Maximum paths to return (1–500, default 20).
+        offset: Pagination offset.
+        summary: True (default) returns compact summaries; False returns full path objects with step details.
+        order: Sort order — risk_score_desc (default), risk_score_asc, created_at_desc, created_at_asc.
+        repository_id: Filter to a single repository.
+        mitre_technique: Filter to paths that include this MITRE technique ID (e.g. "T1078").
+        source_detection_id: Filter to paths produced from a specific detection finding.
+        rescored: When True, narrow to paths a recent re-grade acted on (the "recently
+            re-scored" queue, LD-2247/C1a). Default False preserves the current view.
+        rescored_window_hours: How far back "recently" reaches, in hours (only meaningful
+            with rescored=True). Must be > 0 and <= 8760 (1 year); the server rejects an
+            out-of-range value with a clean 422. Omit to use the server default (72h).
+    """
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if status:
+        params["status"] = status
+    if min_risk_score > 0:
+        params["min_risk_score"] = min_risk_score
+    if order:
+        params["order"] = order
+    if repository_id:
+        params["repository_id"] = repository_id
+    if mitre_technique:
+        params["mitre_technique"] = mitre_technique
+    if source_detection_id:
+        params["source_detection_id"] = source_detection_id
+    # LD-2258 (E6): forward the WS-C C1a `rescored` filter to GET /api/triage/paths
+    # (triage#107). Names/types mirror the server signature verbatim
+    # (`rescored: bool`, `rescored_window_hours: int`, server default 72h, must be > 0) —
+    # an MCP param the server doesn't recognize is dropped silently, so they must match.
+    # Default-off: omit both when unset so there is no behavior change vs the current view.
+    if rescored:
+        params["rescored"] = rescored
+    if rescored_window_hours is not None:
+        params["rescored_window_hours"] = rescored_window_hours
+    result = await _get("/api/triage/paths", _tool="list_attack_paths", **params)
+    return json.dumps(_project_path_list(result, summary=summary, limit=limit, offset=offset))
+
+
+@mcp.tool()
+async def paths_through_node(
+    node_id: str,
+    status: str = "",
+    min_risk_score: float = 0,
+    limit: int = 20,
+    offset: int = 0,
+    summary: bool = True,
+    order: str = "",
+    repository_id: str = "",
+    mitre_technique: str = "",
+) -> str:
+    """Find attack paths that pass through a specific infrastructure node.
+
+    Answers "which attack paths go through this node?" for chokepoint reasoning
+    (a node many high-risk paths traverse is a high-leverage remediation target)
+    and for assessing a CVE on a specific node. Resolved server-side via the
+    node_names index — a containment lookup, not a scan of every path.
+
+    Args:
+        node_id: The InfraDB node name to match (a step's source_node or
+            target_node), e.g. "rds-primary" or "iam:role-1". Required.
+        status: Filter by status. Values: new, acknowledged, validating, validated, ticketed, closed, failed, false_positive.
+        min_risk_score: Only return paths with risk_score >= this value.
+        limit: Maximum paths to return (1–500, default 20).
+        offset: Pagination offset.
+        summary: True (default) returns compact summaries; False returns full path objects with step details.
+        order: Sort order — risk_score_desc (default), risk_score_asc, created_at_desc, created_at_asc.
+        repository_id: Filter to a single repository.
+        mitre_technique: Filter to paths that include this MITRE technique ID (e.g. "T1078").
+    """
+    params: dict[str, Any] = {"node_id": node_id, "limit": limit, "offset": offset}
+    if status:
+        params["status"] = status
+    if min_risk_score > 0:
+        params["min_risk_score"] = min_risk_score
+    if order:
+        params["order"] = order
+    if repository_id:
+        params["repository_id"] = repository_id
+    if mitre_technique:
+        params["mitre_technique"] = mitre_technique
+    result = await _get("/api/triage/paths", _tool="paths_through_node", **params)
+    return json.dumps(_project_path_list(result, summary=summary, limit=limit, offset=offset))
 
 
 @mcp.tool()
 async def get_attack_path(path_id: str) -> str:
-    """Get full details of an attack path including steps, MITRE mappings, and risk score."""
+    """Get full details of an attack path including steps, MITRE mappings, risk score,
+    and reassessment history.
+
+    The response includes ``reassessment_history`` (ordered re-grade timeline)
+    and ``risk_score_model`` (which scoring model produced the risk score).
+    Use ``reassessment_history[-1]`` for RE-SCORED badge logic (risk_before,
+    risk_after, applied_at). Use ``get_triage_config`` for the display threshold.
+    """
     result = await _get(f"/api/triage/paths/{path_id}", _tool="get_attack_path")
     if isinstance(result, dict):
         # Remove internal bookkeeping fields that add noise for customers
@@ -1097,11 +1232,625 @@ async def validate_path(path_id: str) -> str:
 
 
 @mcp.tool()
-async def escalate_path(path_id: str) -> str:
-    """Forward a validated attack path to your configured ticketing system to create a remediation ticket. Use get_ticket_provider() to check which system is configured."""
+async def dismiss_path(
+    path_id: str,
+    reason: str,
+    note: str = "",
+    expires_at: str = "",
+) -> str:
+    """Dismiss an attack path as a false positive with a structured reason.
+
+    Do not use on superseded paths — those were system-dismissed by re-scoring,
+    not operator-dismissed. Use ``list_attack_paths(status="superseded")`` to
+    view them separately.
+
+    Args:
+        path_id: Attack path ID. Must be in 'validated' or 'acknowledged' state.
+        reason: Dismiss reason — one of: compensating_control, network_segmentation,
+                service_decommissioned, risk_accepted, not_applicable, other.
+        note: Optional free-text explanation.
+        expires_at: Optional ISO-8601 datetime after which the dismissal expires and the
+                    path reopens automatically (e.g. "2027-01-01T00:00:00Z").
+    """
+    body: dict[str, Any] = {"reason": reason}
+    if note:
+        body["note"] = note
+    if expires_at:
+        body["expires_at"] = expires_at
     return json.dumps(
-        await _post(f"/api/triage/paths/{path_id}/escalate", _tool="escalate_path")
+        await _post(f"/api/triage/paths/{path_id}/dismiss", body, _tool="dismiss_path")
     )
+
+
+@mcp.tool()
+async def undismiss_path(path_id: str, reason: str, note: str = "") -> str:
+    """Reopen a dismissed (false-positive) attack path back into the triage queue.
+
+    Moves a path from 'false_positive' to 'acknowledged', which clears the
+    dismissal server-side (dismiss_reason/note/expiry are reset) and restores
+    the original risk score. There is no dedicated undismiss endpoint: this is
+    a thin wrapper over PATCH /api/triage/paths/{id}/status. The reason and note
+    are attached to the resulting status_change event so the reopen is
+    attributed and auditable.
+
+    Args:
+        path_id: Attack path ID. Must be in 'false_positive' state; reopening from any
+                 other state is rejected by the triage state machine (422).
+        reason: Required explanation for reopening (logged on the status_change event for audit).
+        note: Optional free-text detail added alongside the reason.
+    """
+    if not path_id.strip():
+        return json.dumps({"error": "path_id is required"})
+    if not reason.strip():
+        return json.dumps({"error": "reason is required"})
+    body: dict[str, Any] = {
+        "status": "acknowledged",
+        "metadata": {"reopen_reason": reason},
+    }
+    if note:
+        body["note"] = note
+    return json.dumps(
+        await _patch(
+            f"/api/triage/paths/{path_id}/status", body, _tool="undismiss_path"
+        )
+    )
+
+
+@mcp.tool()
+async def bulk_update_paths(
+    action: str,
+    status_filter: str = "",
+    min_risk_score: float = 0,
+    repository_id: str = "",
+    reason: str = "",
+    note: str = "",
+    limit: int = 50,
+) -> str:
+    """Apply a triage action to multiple paths that match a filter in a single call.
+
+    Args:
+        action: Action to apply — acknowledge, dismiss, or close.
+        status_filter: Only act on paths in this status (e.g. "validated"). Leave empty to use the
+                       action-compatible defaults: acknowledge→new,failed; dismiss→acknowledged,validated;
+                       close→new,acknowledged,validating,validated,ticketed,failed.
+        min_risk_score: Only act on paths with risk_score >= this value.
+        repository_id: Only act on paths from this repository.
+        reason: Required for action=dismiss. Dismiss reason — one of: compensating_control,
+                network_segmentation, service_decommissioned, risk_accepted, not_applicable, other.
+        note: Optional note applied to every path.
+        limit: Maximum paths to update (1–200, default 50).
+    """
+    if not action:
+        return json.dumps({"error": "action is required"})
+    if action not in {"acknowledge", "dismiss", "close"}:
+        return json.dumps({"error": f"Invalid action '{action}'. Must be acknowledge, dismiss, or close."})
+    if action == "dismiss" and not reason:
+        return json.dumps({"error": "reason is required when action=dismiss"})
+    # Pre-validate action/status_filter compatibility against the triage state machine.
+    # acknowledge is only reachable from new, failed, false_positive (FORWARD_TRANSITIONS).
+    # close is reachable from every non-terminal status.
+    _VALID_SOURCES: dict[str, set[str]] = {
+        "acknowledge": {"new", "failed", "false_positive"},
+        "close": {"new", "acknowledged", "validating", "validated", "ticketed", "failed", "false_positive"},
+        "dismiss": {"acknowledged", "validated"},
+    }
+    if status_filter and action in _VALID_SOURCES and status_filter not in _VALID_SOURCES[action]:
+        valid = sorted(_VALID_SOURCES[action])
+        return json.dumps({
+            "error": (
+                f"action='{action}' cannot be applied to paths in status='{status_filter}'. "
+                f"Valid source statuses: {valid}"
+            )
+        })
+    if limit > 200:
+        limit = 200
+
+    # When no status_filter is given, restrict to states the action can reach.
+    # This prevents predictable partial failures (e.g. dismiss applied to new paths).
+    _DEFAULT_STATUS: dict[str, str] = {
+        "acknowledge": "new,failed",
+        "dismiss": "acknowledged,validated",
+        # Exclude closed/superseded (terminal) so we don't attempt closed→closed.
+        "close": "new,acknowledged,validating,validated,ticketed,failed",
+    }
+    effective_status = status_filter or _DEFAULT_STATUS.get(action, "")
+
+    list_params: dict[str, Any] = {"limit": limit, "offset": 0}
+    if effective_status:
+        list_params["status"] = effective_status
+    if min_risk_score > 0:
+        list_params["min_risk_score"] = min_risk_score
+    if repository_id:
+        list_params["repository_id"] = repository_id
+
+    list_result = await _get("/api/triage/paths", _tool="bulk_update_paths", **list_params)
+    if not isinstance(list_result, dict):
+        return json.dumps({"error": "Failed to fetch paths", "detail": list_result})
+
+    items = list_result.get("items", [])
+    results = []
+    for p in items:
+        if not isinstance(p, dict):
+            continue
+        path_id = p.get("path_id")
+        if not path_id:
+            continue
+        try:
+            if action == "acknowledge":
+                body: dict[str, Any] = {"status": "acknowledged"}
+                if note:
+                    body["note"] = note
+                res = await _patch(f"/api/triage/paths/{path_id}/status", body, _tool="bulk_update_paths")
+            elif action == "dismiss":
+                body = {"reason": reason}
+                if note:
+                    body["note"] = note
+                res = await _post(f"/api/triage/paths/{path_id}/dismiss", body, _tool="bulk_update_paths")
+            else:  # close
+                body = {"status": "closed"}
+                if note:
+                    body["note"] = note
+                res = await _patch(f"/api/triage/paths/{path_id}/status", body, _tool="bulk_update_paths")
+            results.append({"path_id": path_id, "success": True})
+        except Exception as exc:
+            results.append({"path_id": path_id, "success": False, "error": str(exc)})
+
+    succeeded = sum(1 for r in results if r["success"])
+    return json.dumps({
+        "action": action,
+        "total_matched": list_result.get("total", len(items)),
+        "applied_to": len(results),
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
+        "results": results,
+    })
+
+
+@mcp.tool()
+async def override_risk_score(path_id: str, risk_score: float, reason: str) -> str:
+    """Override the computed risk score on an attack path.
+
+    The model score (risk_score) is preserved; user_risk_score is used for
+    display and sorting until cleared. Emits a severity_change event.
+
+    Args:
+        path_id: Attack path ID.
+        risk_score: New risk score (0–100).
+        reason: Required explanation for the override (logged for audit).
+    """
+    body: dict[str, Any] = {"risk_score": risk_score, "reason": reason}
+    return json.dumps(
+        await _post(f"/api/triage/paths/{path_id}/override-risk", body, _tool="override_risk_score")
+    )
+
+
+@mcp.tool()
+async def clear_risk_override(path_id: str) -> str:
+    """Remove a user risk score override; sorting reverts to the model score.
+
+    Args:
+        path_id: Attack path ID.
+    """
+    return json.dumps(
+        await _delete(f"/api/triage/paths/{path_id}/override-risk", _tool="clear_risk_override")
+    )
+
+
+@mcp.tool()
+async def add_path_comment(
+    path_id: str,
+    text: str,
+    author: str = "",
+    parent_comment_id: str = "",
+    parent_event_id: str = "",
+) -> str:
+    """Add a comment to an attack path.
+
+    Writes directly to InfraDB records (``triage_path_comment``), matching
+    the portal's comment client. Comments are returned by ``list_path_comments``
+    and ``list_path_history``.
+
+    Agent attribution (``author_kind: "agent"``) is stamped automatically —
+    MCP comments are always agent-authored.
+
+    Args:
+        path_id: Attack path ID.
+        text: Comment text.
+        author: Optional display name. Defaults to the authenticated identity.
+        parent_comment_id: Reply to another comment (one-level threading).
+            Pass the target comment's ``comment_id``.
+        parent_event_id: Reply to a history event (dismissal, re-grade) that
+            is not itself a comment. Mutually exclusive with parent_comment_id.
+    """
+    from datetime import datetime, timezone
+
+    if not path_id.strip():
+        return json.dumps({"error": "path_id is required"})
+    if not text.strip():
+        return json.dumps({"error": "text is required"})
+
+    comment_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+
+    data: dict[str, Any] = {
+        "comment_id": comment_id,
+        "path_id": path_id,
+        "text": text,
+        "at": now,
+        "author_kind": "agent",
+        "agent_name": "claude",
+    }
+    if author:
+        data["author"] = author
+    if parent_comment_id:
+        data["parent_comment_id"] = parent_comment_id
+    elif parent_event_id:
+        data["parent_event_id"] = parent_event_id
+
+    result = await _post(
+        "/api/infra/records",
+        {
+            "record_type": "triage_path_comment",
+            "key_id": comment_id,
+            "parent_key_id": path_id,
+            "data": data,
+        },
+        _tool="add_path_comment",
+    )
+    if isinstance(result, dict) and (
+        result.get("status") == "authentication_required" or "error" in result
+    ):
+        return json.dumps(result)
+    return json.dumps(data)
+
+
+@mcp.tool()
+async def list_path_history(path_id: str) -> str:
+    """Return the unified timeline for an attack path (LD-2010).
+
+    Includes status changes, score changes, and comments in chronological order.
+    Use this to audit what happened to a path and why.
+
+    Args:
+        path_id: Attack path ID.
+    """
+    return json.dumps(
+        await _get(f"/api/triage/paths/{path_id}/history", _tool="list_path_history")
+    )
+
+
+@mcp.tool()
+async def list_path_comments(path_id: str) -> str:
+    """List all comments on an attack path — the list the portal comments panel shows (LD-2255).
+
+    Comments now live in two stores (LD-2198): new comments are persisted in InfraDB
+    generic records (``record_type=triage_path_comment``, keyed by ``parent_key_id=path_id``),
+    reached through the Portal at ``/api/infra/records``; pre-move comments still sit on the
+    triage service. This tool reads BOTH and merges them into one list — a plain triage proxy
+    would miss every new (post-move) comment. Results are deduplicated by ``comment_id``
+    (InfraDB wins on collision) and returned oldest-first.
+
+    Each comment carries ``text``, ``author`` (SSO email), ``created_at`` (from the payload's
+    ``at``), and the thread anchors ``parent_comment_id`` / ``parent_event_id`` (None on root
+    comments) so replies can be reconstructed as the portal shows them. For the full timeline
+    including status/score changes, use ``list_path_history``.
+
+    Args:
+        path_id: Attack path ID.
+    """
+    # New comments — InfraDB records store, reached through the Portal at
+    # `/api/infra/records`. `LATENT_DEFENSE_URL` is the Portal base URL; the Portal only
+    # proxies InfraDB below `/api/infra/` (nginx rewrites `^/api/infra/(.*)` -> `/api/$1`
+    # before forwarding to InfraDB, so `/api/infra/records` reaches InfraDB's `/api/records`).
+    # Calling `/api/records` directly hits the Portal itself and 404s — every post-move
+    # comment would be missed. This matches the
+    # Portal's own comment client (`portal src/api/pathComments.ts`, PR #310), which reads
+    # `GET /api/infra/records?record_type=triage_path_comment&parent_key_id={path_id}`.
+    #
+    # `/api/records` caps `limit` at 500 (server `le=500`) and returns `total`, so a single
+    # request silently truncates any path with >500 comments. Page through with limit+offset
+    # until we've pulled all `total` records (LD-2255). Records come back newest-first
+    # (created_at DESC, record_id DESC), but final ordering is redone by the sort below, so
+    # page order here is immaterial. Offset paging is fragile under concurrent inserts at
+    # HEAD: the dedup-by-comment_id below collapses a record that appears on two pages, but a
+    # brand-new insert mid-scan can still shift a row past a page boundary and be skipped —
+    # inherent to offset paging (a keyset cursor is the real fix, not yet available).
+    # Acceptable for a read-only comments list. (The Portal caps at 500 and does not page;
+    # returning the full thread here is a deliberate superset for agents.)
+    _RECORDS_PAGE = 500
+    infradb_records: list[Any] = []
+    offset = 0
+    while True:
+        records_resp = await _get(
+            "/api/infra/records",
+            _tool="list_path_comments",
+            record_type="triage_path_comment",
+            parent_key_id=path_id,
+            limit=_RECORDS_PAGE,
+            offset=offset,
+        )
+        # Device-flow auth still pending → surface the browser-approval prompt verbatim
+        # (mirrors run_inference) instead of masquerading it as an empty comment list.
+        if (
+            isinstance(records_resp, dict)
+            and records_resp.get("status") == "authentication_required"
+        ):
+            return json.dumps(records_resp)
+        if not isinstance(records_resp, dict):
+            break
+        page = records_resp.get("records", [])
+        if not isinstance(page, list):
+            break
+        infradb_records.extend(page)
+        # An empty page means we've reached the end — stop unconditionally (also the
+        # backstop for a `total` that over-reports, so we never loop forever).
+        if not page:
+            break
+        # `total` is authoritative for the stopping condition. Guard against a missing/
+        # non-int total (older backend, malformed body) by falling back to "stop when a
+        # page comes back short". `type(total) is int` (not isinstance) so a JSON bool
+        # `total: true` can't masquerade as 1 and truncate at page one.
+        total = records_resp.get("total")
+        got = len(infradb_records)
+        if type(total) is int:
+            if got >= total:
+                break
+        elif len(page) < _RECORDS_PAGE:
+            break
+        # Advance by the actual page size, not the requested limit. If a misbehaving
+        # backend ignores `offset` or over-returns, this keeps offset monotonic with the
+        # data actually consumed instead of over-stepping and silently dropping the tail.
+        offset += len(page)
+
+    # Legacy pre-move comments — best-effort ONLY for the expected 404 (the path is
+    # InfraDB-only, so triage has no comments record). Any other failure (auth, 403,
+    # 5xx) is unexpected and re-raised so a silently-partial list never hides a real
+    # problem. The InfraDB read above stays authoritative and is never suppressed.
+    legacy_comments: list[Any] = []
+    try:
+        legacy = await _get(
+            f"/api/triage/paths/{path_id}/comments", _tool="list_path_comments"
+        )
+        if isinstance(legacy, dict) and legacy.get("status") == "authentication_required":
+            return json.dumps(legacy)
+        if isinstance(legacy, list):
+            legacy_comments = legacy
+    except McpApiError as e:
+        # Only an expected 404 (path is InfraDB-only, so triage has no comments
+        # record) is swallowed; anything else (auth, 403, 5xx) re-raises. Match on
+        # the HTTP status, not the message prefix: handle_response prefers the
+        # structured error envelope for non-401/403 statuses, so a 404 that ships
+        # an {error:{code,message}} envelope carries the envelope's message, not
+        # "Resource not found (404)" — the old prefix check would then abort the
+        # whole tool on an InfraDB-only path (review: claude[bot], LD-2255).
+        if e.status != 404:
+            raise
+        log.warning("list_path_comments: no legacy triage comments for %s (404)", path_id)
+
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    def _first_present(d: dict[str, Any], *keys: str) -> Any:
+        """First key that is PRESENT (not first truthy). A comment written at epoch 0
+        (`at=0`) or with an empty `at` is a real value — an `or` chain would skip it and
+        wrongly fall back to the record envelope's write time, reintroducing the
+        envelope-timestamp bug for falsy-but-valid timestamps."""
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return None
+
+    def _add(comment: dict[str, Any], source: str) -> None:
+        cid = comment.get("comment_id")
+        # Dedup by comment_id; a comment with no id can't collide, so key it uniquely.
+        key = str(cid) if cid is not None else f"_anon_{source}_{len(order)}"
+        if key in merged:
+            return
+        merged[key] = {
+            "comment_id": cid,
+            "path_id": comment.get("path_id", path_id),
+            "actor": comment.get("actor"),
+            "author": comment.get("author"),
+            "author_kind": comment.get("author_kind"),
+            "agent_name": comment.get("agent_name"),
+            "text": comment.get("text"),
+            "created_at": comment.get("created_at"),
+            "parent_comment_id": comment.get("parent_comment_id"),
+            "parent_event_id": comment.get("parent_event_id"),
+            "source": source,
+        }
+        order.append(key)
+
+    # InfraDB records carry the comment payload in `data` (Portal `PathComment` shape:
+    # comment_id, path_id, text, author, parent_comment_id?, parent_event_id?, at). The
+    # canonical timestamp is `data.at` — the Portal maps `created_at = c.at`
+    # (pathComments.ts commentAsHistoryItem). Read `at` FIRST (by presence, so `at=0`/""
+    # is honoured); only then fall back to a payload `created_at`, then the record
+    # envelope's `created_at`. Timestamping from the envelope alone (the earlier bug)
+    # mis-orders comments vs the portal timeline.
+    for rec in infradb_records:
+        if not isinstance(rec, dict):
+            continue
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        created_at = _first_present(data, "at", "created_at")
+        if created_at is None:
+            created_at = rec.get("created_at")
+        # Presence-based, like created_at above: a present-but-falsy comment_id
+        # (0 or "" from an unvalidated writer) is a real id — an `or` chain would
+        # skip it and fall through to the envelope key_id, then dedup by the wrong
+        # key (review: claude[bot], LD-2255). Fall back to key_id only when the
+        # payload has no comment_id at all.
+        comment_id = _first_present(data, "comment_id")
+        if comment_id is None:
+            comment_id = rec.get("key_id")
+        _add(
+            {
+                "comment_id": comment_id,
+                "path_id": data.get("path_id") or rec.get("parent_key_id") or path_id,
+                "actor": data.get("actor"),
+                "author": data.get("author"),
+                "author_kind": data.get("author_kind"),
+                "agent_name": data.get("agent_name"),
+                "text": data.get("text"),
+                "created_at": created_at,
+                "parent_comment_id": data.get("parent_comment_id"),
+                "parent_event_id": data.get("parent_event_id"),
+            },
+            "infradb",
+        )
+
+    # Legacy triage PathComment: {comment_id, path_id, actor, author, text, created_at}
+    # — flat (no threads), timestamp in `created_at`. Normalize `at` -> created_at too in
+    # case a pre-move row already used the newer key.
+    for c in legacy_comments:
+        if isinstance(c, dict):
+            _add(
+                {
+                    "comment_id": c.get("comment_id"),
+                    "path_id": c.get("path_id", path_id),
+                    "actor": c.get("actor"),
+                    "author": c.get("author"),
+                    "author_kind": c.get("author_kind"),
+                    "agent_name": c.get("agent_name"),
+                    "text": c.get("text"),
+                    "created_at": _first_present(c, "created_at", "at"),
+                    "parent_comment_id": c.get("parent_comment_id"),
+                    "parent_event_id": c.get("parent_event_id"),
+                },
+                "triage",
+            )
+
+    comments = [merged[k] for k in order]
+    # Oldest-first. created_at is normally an ISO-8601 string (lexicographic ==
+    # chronological), but InfraDB generic-records `data` is unvalidated, so coerce to
+    # str to avoid a str-vs-int TypeError if a client wrote a numeric timestamp.
+    # (A numeric `at` then sorts lexicographically, not chronologically — best-effort
+    # only for such non-canonical writes; real ISO-8601 comments order correctly.)
+    # Missing created_at (pre-LD-2010 blobs) sorts last, deterministically.
+    comments.sort(key=lambda c: (c.get("created_at") is None, str(c.get("created_at") or "")))
+
+    return json.dumps(comments)
+
+
+@mcp.tool()
+async def edit_path_comment(path_id: str, comment_id: str, text: str) -> str:
+    """Edit the text of an existing comment on an attack path.
+
+    Appends a new revision (LD-2185 D1, option b) — does not overwrite. The
+    previous revision stays in InfraDB untouched, preserving a full edit trail.
+    Matches the portal's ``editPathComment`` in ``pathComments.ts``.
+
+    Authorship is enforced server-side (infradb#88): a write that supersedes
+    another user's revision is rejected with HTTP 403.
+
+    Args:
+        path_id: Attack path ID the comment is on.
+        comment_id: Logical comment id to edit (stable across edits).
+        text: The new comment text.
+    """
+    from datetime import datetime, timezone
+
+    if not path_id.strip():
+        return json.dumps({"error": "path_id is required"})
+    if not comment_id.strip():
+        return json.dumps({"error": "comment_id is required"})
+    if not text.strip():
+        return json.dumps({"error": "text is required"})
+
+    _RECORDS_PAGE = 500
+    records: list[Any] = []
+    offset = 0
+    while True:
+        resp = await _get(
+            "/api/infra/records",
+            _tool="edit_path_comment",
+            record_type="triage_path_comment",
+            parent_key_id=path_id,
+            limit=_RECORDS_PAGE,
+            offset=offset,
+        )
+        if isinstance(resp, dict) and resp.get("status") == "authentication_required":
+            return json.dumps(resp)
+        if not isinstance(resp, dict):
+            break
+        page = resp.get("records", [])
+        if not isinstance(page, list):
+            break
+        records.extend(page)
+        if not page:
+            break
+        total = resp.get("total")
+        if type(total) is int:
+            if len(records) >= total:
+                break
+        elif len(page) < _RECORDS_PAGE:
+            break
+        offset += len(page)
+
+    def _fp(d: dict[str, Any], *keys: str) -> Any:
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return None
+
+    def _revision_at(data: dict[str, Any]) -> str:
+        for k in ("edited_at", "at"):
+            if k in data and data[k] is not None:
+                return str(data[k]).replace("+00:00", "Z")
+        return ""
+
+    current_key: str | None = None
+    current_data: dict[str, Any] | None = None
+    best_at: str | None = None
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+        rec_comment_id = _fp(data, "comment_id", "revision_id")
+        if rec_comment_id is None:
+            rec_comment_id = rec.get("key_id")
+        if str(rec_comment_id) != str(comment_id):
+            continue
+        at = _revision_at(data)
+        if best_at is None or at > best_at:
+            best_at = at
+            current_key = rec.get("key_id")
+            current_data = data
+
+    if current_data is None or current_key is None:
+        return json.dumps(
+            {"error": f"comment '{comment_id}' not found on path '{path_id}'"}
+        )
+
+    new_revision_id = uuid.uuid4().hex
+    resolved_comment_id = _fp(current_data, "comment_id", "revision_id")
+    if resolved_comment_id is None:
+        resolved_comment_id = current_key
+    new_data = {
+        **current_data,
+        "comment_id": str(resolved_comment_id),
+        "path_id": current_data.get("path_id", path_id),
+        "text": text,
+        "revision_id": new_revision_id,
+        "supersedes": current_key,
+        "edited_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    result = await _post(
+        "/api/infra/records",
+        {
+            "record_type": "triage_path_comment",
+            "key_id": new_revision_id,
+            "parent_key_id": path_id,
+            "data": new_data,
+        },
+        _tool="edit_path_comment",
+    )
+    if isinstance(result, dict) and (
+        result.get("status") == "authentication_required" or "error" in result
+    ):
+        return json.dumps(result)
+    return json.dumps(new_data)
 
 
 @mcp.tool()
@@ -1111,6 +1860,34 @@ async def triage_stats(repository_id: str = "") -> str:
     if repository_id:
         params["repository_id"] = repository_id
     return json.dumps(await _get("/api/triage/stats", _tool="triage_stats", **params))
+
+
+@mcp.tool()
+async def get_triage_config() -> str:
+    """Get triage display configuration.
+
+    Returns the rescore display threshold and any other published config.
+    Use this to apply the same re-score badge display logic the portal uses
+    when deciding whether a risk score change is worth reporting.
+    """
+    return json.dumps(
+        await _get("/api/triage/config", _tool="get_triage_config")
+    )
+
+
+@mcp.tool()
+async def get_classification_stats(repository_id: str = "") -> str:
+    """Get attack path classification statistics (breakdown by classification).
+
+    Args:
+        repository_id: Filter to a single repository. Empty for all.
+    """
+    params = {}
+    if repository_id:
+        params["repository_id"] = repository_id
+    return json.dumps(
+        await _get("/api/triage/stats/classification", _tool="get_classification_stats", **params)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1149,7 +1926,7 @@ async def register_webhook(
     VALID_EVENTS = {
         "new_path", "status_change", "validation_complete",
         "path_acknowledged", "path_dispatched_to_validator",
-        "path_escalated_to_ticketing", "severity_change",
+        "severity_change",
     }
     invalid = [e for e in parsed_events if e not in VALID_EVENTS]
     if invalid:
@@ -1731,7 +2508,7 @@ def _stop_keepalive():
 async def _oracle_call(
     method: str, params: dict | None = None, *, _tool: str = ""
 ) -> str:
-    import time
+    import time as _time
 
     global _oracle_session, _load_branch_id, _encoding_started_at, _graph_loaded
     sid = await _ensure_oracle_session()
@@ -1744,7 +2521,7 @@ async def _oracle_call(
         )
     except (httpx.TimeoutException, httpx.ConnectError):
         if not _graph_loaded and _encoding_started_at is not None:
-            elapsed = int(time.time() - _encoding_started_at)
+            elapsed = int(_time.time() - _encoding_started_at)
             return json.dumps(
                 {
                     "status": "loading",
@@ -1775,11 +2552,10 @@ async def _oracle_call(
         _encoding_started_at = None
         _graph_loaded = False
         _stop_keepalive()
-        print(
+        log.warning(
             "Oracle session expired (30-minute idle timeout). "
             "Creating a new session. You will need to reload your "
             "graph with oracle_load_branch().",
-            file=sys.stderr,
         )
         await _ensure_oracle_session()
         return json.dumps(
@@ -2508,6 +3284,367 @@ async def oracle_reset_session() -> str:
             pass
         _oracle_session = None
     return json.dumps({"status": "session reset"})
+
+
+# ---------------------------------------------------------------------------
+# Prompts (LD-2053) — agentic triage workflows that replace the portal Research
+# tab. Each is a one-shot @mcp.prompt() that expands into a structured set of
+# instructions the calling agent follows using the tools already on this server.
+# ---------------------------------------------------------------------------
+
+
+@mcp.prompt(
+    title="Review the triage queue",
+    description=(
+        "Walk the highest-risk untriaged attack paths and decide what to do with "
+        "each. Uses list_attack_paths + triage_stats."
+    ),
+)
+def triage_queue_review(
+    repository_id: str = "",
+    min_risk_score: float = 0,
+    status: str = "new",
+) -> str:
+    """One-click triage queue review — the interactive triage skill as a prompt.
+
+    Args:
+        repository_id: Restrict the review to a single repository (default: all).
+        min_risk_score: Only surface paths with risk_score >= this value (default: 0).
+        status: Restrict the queue to a single triage status (default: "new", the
+            untriaged inbox). list_attack_paths' unfiltered default returns every
+            status except false_positive — including terminal paths (ticketed,
+            closed, failed) that would pollute the queue and can't be actioned — so
+            the queue is pinned to "new" here. Pass "" to review every status; the
+            prompt still constrains the offered actions to those valid per state.
+    """
+    # Build the exact list_attack_paths call the agent should make. Every
+    # client-supplied string is threaded through json.dumps so a value containing
+    # a quote, backslash or newline can't corrupt the example call or inject text
+    # into the agent's instruction stream. summary=False so per-step MITRE
+    # techniques are available (the summary view collapses steps).
+    call_args = ['order="risk_score_desc"', "summary=False", "limit=20"]
+    if status:
+        call_args.insert(0, f"status={json.dumps(status)}")
+    if repository_id:
+        call_args.append(f"repository_id={json.dumps(repository_id)}")
+    if min_risk_score > 0:
+        call_args.append(f"min_risk_score={min_risk_score}")
+    list_call = f"list_attack_paths({', '.join(call_args)})"
+
+    stats_arg = f"repository_id={json.dumps(repository_id)}" if repository_id else ""
+
+    scope_bits = [
+        f"repository {json.dumps(repository_id)}" if repository_id else "all repositories",
+        f"status {json.dumps(status)}" if status else "all statuses",
+    ]
+    if min_risk_score > 0:
+        scope_bits.append(f"risk_score >= {min_risk_score}")
+    scope = ", ".join(scope_bits)
+
+    return f"""\
+You are reviewing the Latent Defense triage queue ({scope}). Work through it as an
+interactive triage session.
+
+1. Load the ranked queue. Call:
+       {list_call}
+   This returns attack paths ordered highest-risk first. Because `summary=False`,
+   each path includes its full step list (with the MITRE technique IDs per step).
+   If the response reports `has_more: true` (or `total` exceeds the number of items
+   returned), tell me — there are more paths than the top 20 shown and I may want
+   to page through the rest with `offset`.
+
+2. Load the queue-level counts. Call:
+       triage_stats({stats_arg})
+   Use this to frame the review (how many paths are new / validating / validated /
+   ticketed / closed).
+
+3. Present the top findings as a ranked list. For each path show:
+     - risk_score (and user_risk_score if a manual override is set)
+     - entry_node -> target_node
+     - the distinct MITRE technique IDs collected from its steps
+     - validation status (the path `status` field: new, acknowledged, validating,
+       validated, ticketed, closed, failed, false_positive)
+
+4. For each path, ask me what to do and carry out the choice with the tool that is
+   valid for that path's current `status`. Skip paths already in a terminal state
+   (ticketed, closed, failed, false_positive) — they need no action.
+     - acknowledge -> update_path_status(path_id, "acknowledged")   (from `new`)
+     - validate    -> validate_path(path_id)                        (from `new` or `acknowledged`)
+     - re-score    -> override_risk_score(path_id, risk_score=..., reason=...)
+     - dismiss     -> dismiss_path requires the path to be `acknowledged` or
+                      `validated`, so if it is still `new` call
+                      update_path_status(path_id, "acknowledged") first, then
+                      dismiss_path(path_id, reason=...). `reason` must be one of:
+                      compensating_control, network_segmentation,
+                      service_decommissioned, risk_accepted, not_applicable, other.
+
+Start now with step 1, then summarise the queue before we walk the individual paths.
+"""
+
+
+@mcp.prompt(
+    title="Assess CVE exposure",
+    description=(
+        "Investigate a CVE's exposure across the infrastructure graph. "
+        "Uses search_nodes + oracle_search_nodes + paths_through_node."
+    ),
+)
+def assess_cve(
+    cve_id: str,
+    repository_id: str = "",
+) -> str:
+    """Assess the exposure of a specific CVE across the infrastructure.
+
+    Args:
+        cve_id: CVE identifier (e.g. "CVE-2024-1234").
+        repository_id: Restrict the assessment to a single repository (default: all).
+    """
+    repo_filter = ""
+    if repository_id:
+        repo_filter = f", repository_id={json.dumps(repository_id)}"
+
+    return f"""\
+You are assessing the exposure of {json.dumps(cve_id)} across the infrastructure.
+
+1. Find affected nodes. Call BOTH:
+       search_nodes(repo_id={json.dumps(repository_id) if repository_id else '""'}, query={json.dumps(cve_id)})
+       oracle_search_nodes(query={json.dumps(cve_id)})
+   Deduplicate by node name. If zero results, the CVE may not be present in the
+   current graph — report that clearly and stop.
+
+2. For each affected node, find attack paths through it:
+       paths_through_node(node_id=<node_name>{repo_filter})
+   Collect all paths. Note the risk scores and validation statuses.
+
+3. Present an exposure summary:
+   - **Affected nodes**: list each node with its type and location
+   - **Attack paths**: for each path through an affected node, show:
+     * risk_score
+     * entry_node -> target_node
+     * MITRE techniques
+     * validation status
+   - **Risk assessment**: highest risk score, number of paths, whether any
+     are validated/exploitable
+   - **Recommendation**: whether to validate, dismiss, or escalate
+
+If there are many paths (>20), summarise by risk band and highlight the top 5.
+"""
+
+
+@mcp.prompt(
+    title="Chokepoint report",
+    description=(
+        "Identify infrastructure chokepoints where many attack paths converge. "
+        "Uses list_attack_paths + paths_through_node."
+    ),
+)
+def chokepoint_report(
+    repository_id: str = "",
+    min_paths: int = 3,
+) -> str:
+    """Identify chokepoints — nodes through which many attack paths flow.
+
+    Args:
+        repository_id: Restrict the report to a single repository (default: all).
+        min_paths: Minimum number of paths a node must appear in to qualify as
+            a chokepoint (default: 3).
+    """
+    repo_filter = ""
+    if repository_id:
+        repo_filter = f", repository_id={json.dumps(repository_id)}"
+
+    return f"""\
+You are generating a chokepoint report for the infrastructure.
+
+1. Load the top attack paths. Call:
+       list_attack_paths(limit=200, order="risk_score_desc", summary=False{repo_filter})
+   If `has_more` is true, page through with `offset` until you have all paths (or
+   up to 500).
+
+2. Extract node frequency. For each path, collect all nodes from its steps
+   (source_node and target_node). Count how many distinct paths each node appears in.
+
+3. Filter to chokepoints: nodes appearing in >= {min_paths} paths.
+
+4. For each chokepoint node (sorted by path count descending), call:
+       paths_through_node(node_id=<node_name>{repo_filter})
+   to get the full path details.
+
+5. Present the chokepoint report. For each chokepoint:
+   - **Node**: name and type
+   - **Path count**: how many attack paths flow through it
+   - **Highest risk score**: among the paths through this node
+   - **Validation status**: how many paths are validated vs unvalidated
+   - **MITRE techniques**: distinct techniques across paths through this node
+
+6. End with a prioritised remediation recommendation:
+   - Which chokepoint, if hardened, would eliminate the most high-risk paths?
+   - Estimate the risk reduction (number of paths × average risk score).
+"""
+
+
+# ---------------------------------------------------------------------------
+# Energy graph cache — local merged graph+energy data for structural triage
+# ---------------------------------------------------------------------------
+
+
+_jepa_keepalive_task: object | None = None
+
+
+def _get_energy_cache() -> EnergyGraphCache | None:
+    """Accessor for the energy cache — passed to tool modules."""
+    return _energy_cache
+
+
+def _start_jepa_keepalive(branch_id: str, repository_id: str):
+    """Ping the JEPA graph_metadata endpoint every 5 min to prevent cache reaping."""
+    global _jepa_keepalive_task
+
+    _stop_jepa_keepalive()
+
+    async def _loop():
+        while True:
+            await asyncio.sleep(300)
+            try:
+                client = await _http()
+                await client.post(
+                    "/api/jepa/graph_metadata",
+                    params={"branch_id": branch_id, "repository_id": repository_id},
+                    json={},
+                    timeout=15,
+                )
+            except Exception:
+                pass
+
+    _jepa_keepalive_task = asyncio.create_task(_loop())
+
+
+def _stop_jepa_keepalive():
+    global _jepa_keepalive_task
+    if _jepa_keepalive_task is not None:
+        _jepa_keepalive_task.cancel()
+        _jepa_keepalive_task = None
+
+
+@mcp.tool()
+async def load_graph_energies(branch_id: str) -> str:
+    """Load an infrastructure graph with JEPA energy scores for structural triage.
+
+    Fetches the full graph from InfraDB and energy scores from the inference
+    server, merging them into a local cache. All energy_* and grep_* tools
+    require this to be called first.
+
+    For large graphs (1000+ nodes), the first load triggers JEPA encoding which
+    takes 2-5 minutes. Use oracle_load_branch first to warm the disk cache with
+    progress updates, then call this tool — it will be fast (~10s).
+
+    If you haven't loaded via oracle first, this tool will trigger encoding
+    directly but without progress updates.
+    """
+    global _energy_cache
+
+    # Try reloading from existing SQLite cache on disk (survives process restart)
+    cached = EnergyGraphCache.from_disk(branch_id)
+    if cached is not None:
+        if _energy_cache is not None:
+            _energy_cache.close()
+        _energy_cache = cached
+        if cached.has_energies and cached.repository_id:
+            _start_jepa_keepalive(branch_id, cached.repository_id)
+        return json.dumps({
+            "status": "loaded",
+            "source": "disk_cache",
+            "branch_id": branch_id,
+            "n_nodes": cached._n_nodes,
+            "n_edges": cached._n_edges,
+            "n_node_types": cached._n_node_types,
+            "n_edge_types": cached._n_edge_types,
+            "n_containment_edges": cached._n_containment,
+            "commit_id": cached.commit_id,
+            "has_energies": cached.has_energies,
+        })
+
+    try:
+        client = await _http()
+    except DeviceFlowPending as e:
+        return json.dumps(_auth_pending_response(e))
+
+    try:
+        cache = await EnergyGraphCache.build(branch_id, client)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 401:
+            refreshed = await _refresh_client()
+            if refreshed is not None:
+                try:
+                    cache = await EnergyGraphCache.build(branch_id, refreshed)
+                except Exception as retry_err:
+                    return json.dumps({
+                        "error": "load_failed",
+                        "message": f"Failed to load graph energies after token refresh: {retry_err}",
+                    })
+            else:
+                return json.dumps({
+                    "error": "authentication_failed",
+                    "message": "Token expired during graph loading and could not be refreshed.",
+                })
+        else:
+            return json.dumps({
+                "error": "load_failed",
+                "message": f"HTTP {exc.response.status_code} from {exc.request.url.path}: {exc.response.text[:200]}",
+            })
+    except Exception as exc:
+        return json.dumps({
+            "error": "load_failed",
+            "message": f"Failed to load graph energies: {exc}",
+        })
+
+    # Close previous cache (SQLite connection) before replacing
+    if _energy_cache is not None:
+        _energy_cache.close()
+    _energy_cache = cache
+
+    if cache.has_energies and cache.repository_id:
+        _start_jepa_keepalive(branch_id, cache.repository_id)
+
+    result: dict[str, Any] = {
+        "status": "loaded",
+        "branch_id": branch_id,
+        "n_nodes": cache._n_nodes,
+        "n_edges": cache._n_edges,
+        "n_node_types": cache._n_node_types,
+        "n_edge_types": cache._n_edge_types,
+        "n_containment_edges": cache._n_containment,
+        "commit_id": cache.commit_id,
+        "has_energies": cache.has_energies,
+    }
+    if not cache.has_energies:
+        result["status"] = "loaded_without_energies"
+        result["energy_error"] = cache.energy_error
+        result["next_step"] = (
+            "Graph tools (read_node, grep_nodes, find_nodes_by_type, etc.) work. "
+            "Energy tools require JEPA energy scores. To load them: "
+            "oracle_load_branch(branch_id) → oracle_wait_for_load() → "
+            "then retry load_graph_energies(branch_id)."
+        )
+    if cache.energies_incomplete:
+        result["warning"] = (
+            "Transition energy data is incomplete — the SSE stream closed "
+            "before delivering results. Energy tools will work but some edges "
+            "will have no energy scores."
+        )
+    return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# Register tool modules
+# ---------------------------------------------------------------------------
+
+
+from . import energy_tools, graph_tools, triage_state  # noqa: E402
+
+graph_tools.register(mcp, _get_energy_cache)
+energy_tools.register(mcp, _get_energy_cache)
+triage_state.register(mcp)
 
 
 def main():

@@ -13,3 +13,4 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv build
       - run: uv run latent-defense-mcp --help || true
+      - run: uv run pytest tests/ -v

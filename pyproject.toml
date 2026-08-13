@@ -29,7 +29,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://latentdefense.ai"
 Documentation = "https://docs.latentdefense.ai"
-Repository = "https://github.com/latent-defense/latent-defense-mcp"
+Repository = "https://github.com/latent-defense/mcp-server"
 
 [project.scripts]
 latent-defense-mcp = "latent_defense_mcp.server:main"
@@ -39,3 +39,12 @@ latent-defense-mcp-login = "latent_defense_mcp.login:main"
 [tool.hatch.build.targets.wheel]
 packages = ["latent_defense_mcp"]
 artifacts = ["latent_defense_mcp/skills/**/*.md"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
