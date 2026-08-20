@@ -1,11 +1,11 @@
-"""LD-2052: `paths_through_node(node_id)` MCP tool.
+"""list_attack_paths(node_id=) — filter attack paths by node.
 
-A thin `triage:read` wrapper over `GET /api/triage/paths?node_id=X`, which the
-triage backend resolves server-side via the InfraDB `node_names` GIN index
-(`node_names @> ARRAY[node_id]`). These tests monkeypatch the `_get` HTTP seam
-so no live server is needed — they pin that node_id (and the other filters) are
-forwarded, that the summary projection matches list_attack_paths, and that the
-tool is registered as triage:read.
+Tests that the ``node_id`` filter on ``list_attack_paths`` correctly forwards
+to ``GET /api/triage/paths?node_id=X`` (resolved server-side via the infrastructure database
+``node_names`` GIN index). These tests monkeypatch the ``_get`` HTTP seam so no
+live server is needed — they pin that node_id (and the other filters) are
+forwarded, that the summary projection works, and that the tool is registered
+as triage:read.
 """
 
 import json
@@ -38,7 +38,7 @@ def _make_path(**overrides):
     return p
 
 
-class TestPathsThroughNodeForwarding:
+class TestListAttackPathsNodeIdForwarding:
     async def test_node_id_is_forwarded(self, monkeypatch):
         seen = {}
 
@@ -49,10 +49,10 @@ class TestPathsThroughNodeForwarding:
             return {"items": [], "total": 0}
 
         monkeypatch.setattr(server, "_get", fake_get)
-        await server.paths_through_node(node_id="rds-primary")
+        await server.list_attack_paths(node_id="rds-primary")
 
         assert seen["path"] == "/api/triage/paths"
-        assert seen["tool"] == "paths_through_node"
+        assert seen["tool"] == "list_attack_paths"
         assert seen["params"].get("node_id") == "rds-primary"
 
     async def test_combines_with_other_filters(self, monkeypatch):
@@ -63,7 +63,7 @@ class TestPathsThroughNodeForwarding:
             return {"items": [], "total": 0}
 
         monkeypatch.setattr(server, "_get", fake_get)
-        await server.paths_through_node(
+        await server.list_attack_paths(
             node_id="rds-primary",
             status="acknowledged",
             min_risk_score=60,
@@ -90,18 +90,18 @@ class TestPathsThroughNodeForwarding:
             return {"items": [], "total": 0}
 
         monkeypatch.setattr(server, "_get", fake_get)
-        await server.paths_through_node(node_id="rds-primary")
+        await server.list_attack_paths(node_id="rds-primary")
 
         assert set(seen["params"]) == {"node_id", "limit", "offset"}
 
 
-class TestPathsThroughNodeProjection:
+class TestListAttackPathsNodeIdProjection:
     async def test_summary_returns_compact_entries(self, monkeypatch):
         async def fake_get(path, *, _tool="", **params):
             return {"items": [_make_path()], "total": 1}
 
         monkeypatch.setattr(server, "_get", fake_get)
-        out = json.loads(await server.paths_through_node(node_id="rds-primary"))
+        out = json.loads(await server.list_attack_paths(node_id="rds-primary"))
 
         assert out["total"] == 1
         assert out["has_more"] is False
@@ -119,11 +119,11 @@ class TestPathsThroughNodeProjection:
 
         monkeypatch.setattr(server, "_get", fake_get)
         out = json.loads(
-            await server.paths_through_node(node_id="rds-primary", summary=False)
+            await server.list_attack_paths(node_id="rds-primary", summary=False)
         )
         assert out["items"][0]["steps"][0]["target_node"] == "rds-primary"
 
 
-class TestPathsThroughNodeScope:
+class TestListAttackPathsScope:
     async def test_registered_as_triage_read(self):
-        assert TOOL_SCOPES["paths_through_node"] == "triage:read"
+        assert TOOL_SCOPES["list_attack_paths"] == "triage:read"

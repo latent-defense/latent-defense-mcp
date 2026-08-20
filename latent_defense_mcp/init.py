@@ -11,10 +11,41 @@ from pathlib import Path
 PACKAGE_DIR = Path(__file__).resolve().parent
 
 
+def _find_skill_source() -> Path | None:
+    """Locate the bundled skill files.
+
+    Two layouts are supported:
+
+    1. **Installed wheel** — skills are bundled at
+       ``latent_defense_mcp/skills/claude/`` inside the package via
+       ``[tool.hatch.build.targets.wheel.force-include]``.
+    2. **Git checkout** — ``.claude/skills/`` lives at the repo root
+       (one level above the package directory) and contains symlinks to
+       ``skills/`` for the shared skills.
+    """
+    # 1. Wheel-bundled skills (preferred — works for pip-installed users)
+    bundled = PACKAGE_DIR / "skills" / "claude"
+    if bundled.is_dir():
+        return bundled
+
+    # 2. Git checkout — repo_root/.claude/skills/
+    repo_root = PACKAGE_DIR.parent
+    checkout = repo_root / ".claude" / "skills"
+    if checkout.is_dir():
+        return checkout
+
+    # 3. Git checkout fallback — shared skills only
+    shared = repo_root / "skills"
+    if shared.is_dir():
+        return shared
+
+    return None
+
+
 def _copy_skills(dest: Path) -> list[str]:
     """Copy bundled skills into the target project's .claude/skills/ directory."""
-    src = PACKAGE_DIR / "skills"
-    if not src.exists():
+    src = _find_skill_source()
+    if src is None:
         return []
     dest_skills = dest / ".claude" / "skills"
     copied = []
@@ -25,6 +56,7 @@ def _copy_skills(dest: Path) -> list[str]:
         if target.exists():
             print(f"  skip {target.relative_to(dest)} (already exists)")
             continue
+        # follow_symlinks=True (default) resolves symlinks to shared skills
         shutil.copytree(skill_dir, target)
         copied.append(skill_dir.name)
         print(f"  created {target.relative_to(dest)}")
@@ -104,13 +136,17 @@ def main():
         print("  - .claude/skills/setup/              — connect to Latent Defense (start here)")
         print("  - .claude/skills/setup-headless/     — automatic setup (no prompts)")
         print("  - .claude/skills/setup-interactive/  — step-by-step guided setup")
+        print("  - .claude/skills/tutorial/           — interactive walkthrough of the world model")
+        print("  - .claude/skills/my-data/            — see everything in your deployment")
+        print("  - .claude/skills/explore/            — browse infrastructure graph")
+        print("  - .claude/skills/investigate/        — investigate CVEs, detections, alerts")
+        print("  - .claude/skills/triage/             — structural security triage at scale")
+        print("  - .claude/skills/research/           — proactive attack path discovery")
+        print("  - .claude/skills/review/             — review attack paths in the triage queue")
+        print("  - .claude/skills/diff/               — compare graph snapshots")
         print("  - .claude/skills/map/                — guided mapping workflow")
-        print("  - .claude/skills/research/           — interactive security research")
-        print("  - .claude/skills/investigate/        — security investigation and posture queries")
-        print("  - .claude/skills/health-check/       — deployment configuration check")
-        print("  - .claude/skills/triage/             — attack path triage queue")
-        print("  - .claude/skills/remediate/          — remediation ticket lifecycle")
-        print("  - .claude/skills/monitor/            — automated scanning and alerting")
+        print("  - .claude/skills/rerun-inference/    — re-run JEPA inference after changes")
+        print("  - .claude/skills/build/              — integrations — webhooks, SIEM, connectors")
         print("  - .claude/skills/status/             — deployment health dashboard")
         print()
         print("If directory is omitted, uses the current directory.")

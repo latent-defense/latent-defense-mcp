@@ -14,7 +14,7 @@ Set up the Latent Defense MCP server in the current project. This skill configur
 The user should provide their portal endpoint URL as the argument, e.g.:
 
 ```
-/setup https://portal.acme-corp.latentdefense.ai
+/setup https://portal.acme-corp.com
 ```
 
 If no URL is provided, ask the user for their portal URL. It looks like `https://portal-<name>.latentdefense.ai` or a custom domain their admin configured.
@@ -35,4 +35,4 @@ If the user picks interactive, invoke `/setup-interactive` with the portal URL.
 
 - Both modes produce identical results — the same `.mcp.json`, same skills, same auth
 - Automatic is faster; interactive is for users who want to understand what's being configured
-- After either mode completes, suggest running `/health-check` to verify the deployment is healthy
+- After either mode completes, suggest running `/status deep` to verify the deployment is healthy

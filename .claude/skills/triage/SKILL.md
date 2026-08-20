@@ -1,240 +1,287 @@
 ---
 name: triage
-description: "Guided attack path triage queue. Review, validate, dismiss, or ticket attack paths discovered by inference."
+description: "Structural security triage. Process scanner findings, group by remediation action, investigate against the infrastructure graph using JEPA energy signals, and produce audience-specific reports. Orchestrates parallel sub-agents for each pipeline phase."
 user-invocable: true
 disable-model-invocation: false
 ---
 
-# Triage — Attack Path Queue
+# Structural Security Triage
 
-Work through the attack path triage queue. For each path: review the details, decide whether to validate it in a sandbox, acknowledge it, dismiss it, or create a remediation ticket.
+## What this system does
 
-## Prerequisites
+Security teams drown in findings. Thousands of CVEs, hundreds of code defects, dozens of misconfigurations — each scanner reporting independently with no awareness of the infrastructure topology. This system takes findings from any source and determines what actually matters by grounding each finding in the infrastructure graph.
 
-- The `latent-defense` MCP server must be connected
-- Attack paths must exist — discovered via `/research`, `/investigate`, or batch inference after `/map`
+The core insight: most findings are noise not because they're wrong, but because they lack context. A critical CVE in a package that's unreachable from any entry point is operationally irrelevant. A medium-severity misconfiguration on a service that handles credentials for every other service is urgent. The graph and the JEPA energy model provide that context.
 
-## Quick reference — tool names
+**The fundamental unit of triage is not "a vulnerability" but "a remediation action."** Thirty CVEs fixed by one base image rebuild are one item on the engineering backlog. Four services needing the same auth middleware are one design decision. The system discovers these structural groups, investigates each against real code and configuration, and produces audience-specific reports.
 
-| Tool | What it does |
-|------|-------------|
-| `list_attack_paths(status, min_risk_score, limit, offset, order, repository_id, mitre_technique, source_detection_id)` | Query attack paths with optional filters |
-| `get_attack_path(path_id)` | Full path details: steps, MITRE mappings, risk score, difficulty |
-| `update_path_status(path_id, status, note)` | Change a path's triage status |
-| `validate_path(path_id)` | Dispatch to sandbox validation |
-| `dismiss_path(path_id, reason, note, expires_at)` | Dismiss a path as false positive with structured reason |
-| `bulk_update_paths(action, status_filter, repository_id, reason, note, limit)` | Apply acknowledge/dismiss/close to multiple matching paths |
-| `override_risk_score(path_id, risk_score, reason)` | Set a user risk score (0–100); model score preserved alongside |
-| `clear_risk_override(path_id)` | Remove user score override; sorting reverts to model score |
-| `add_path_comment(path_id, author, text)` | Attach an investigation note or decision to a path |
-| `list_path_history(path_id)` | Unified timeline: status changes, score changes, comments |
-| `get_validation_status(run_id)` | Check sandbox validation progress |
-| `triage_stats(repository_id)` | Aggregate counts by status |
+## How the pipeline works
 
-## Workflow
+Seven phases: **Load → Discover → Group → Sweep → Investigate → Route → Deliver**
 
-### Step 1 — Load the queue
+**Load** — Loads the infrastructure graph with JEPA energy scores into a local SQLite cache. One agent, runs once. All subsequent agents query the same cache.
 
-Call `list_attack_paths(status="new", limit=20)` and `triage_stats()` in parallel.
+**Discover** — One agent reads ALL findings across all sources and identifies 8-20 high-level remediation clusters. Groups by fix action, not surface attribute: "all services missing authentication" is one cluster regardless of service name. The agent identifies patterns — it doesn't assign individual findings yet.
 
-`list_attack_paths` returns:
+**Group** — Parallel agents, one per cluster, each claim specific findings by 0-based index. They read the findings, match to the cluster's description, and either terminate as a leaf (one fix covers all) or split into sub-groups. Energy tools guide split decisions:
+- Entry energy spread > 2.0 across a cluster's findings → SPLIT by exposure zone (some exposed, some interior)
+- `energy_trace_to_target` between two anchors returns "not reachable" → SPLIT (structurally disconnected)
+- All findings anchor to similar-energy nodes → keep together
+
+A global tracker prevents double-claims across parallel agents. The recursion terminates at leaf groups or depth limit.
+
+**Why group before anchoring:** Most scanner findings (OS package CVEs) don't have graph nodes. `libdb5.3` isn't in the graph; the database-proxy service that contains it is. A parent agent recognizes "these are all OS package CVEs in the database-proxy image" from finding text alone — no graph needed. Energy tools then anchor the group as a whole. One intelligent anchoring per group, not thousands of mechanical anchoring attempts per CVE.
+
+**Sweep** — One agent handles unclaimed findings. Uses cross-references from Group agents and energy proximity to assign each to an existing group or create new ones. After sweep: every finding claimed exactly once.
+
+**Investigate** — Two-stage pipeline per group:
+- Stage 1 (Explore): Energy-only. Maps structural position using `energy_node_scores`, `energy_lowest_hop`, `energy_trace_to_target`. Produces: where does this sit, what controls exist, what's reachable, what files should the verifier check?
+- Stage 2 (Verify): Code/config verification. Gets the structural map, reads actual source code or configuration via the configured verification channels. Produces a verdict (confirmed / refuted / partial) with evidence cited from code, not from the graph.
+
+The two-stage split is intentional — it prevents agents from skipping energy exploration and falling back to grep, or from citing graph topology as verification.
+
+**Route** — For groups beyond the investigation limit, a lightweight classifier assigns: eliminable, reducible, constrained, drift_prone, or mitigated.
+
+**Deliver** — Parallel agents, one per audience, generate reports using stored audience preferences.
+
+## Evidence hierarchy
+
+Verification must use a different source than screening. Strict order:
+
+1. **Source code** — the actual implementation. Highest authority.
+2. **Configuration files** — the actual kong.yml, Dockerfile, Helm values.
+3. **Cloud API** — live state from AWS/Azure/GCP CLI queries.
+4. **Semantic context** — the graph node's natural-language description. Used when source code isn't available.
+5. **Graph structure** — which nodes connect via what edge types. Structural evidence.
+6. **Energy scores** — structural exposure and resistance. Screening evidence only.
+
+"The graph shows 0 auth edges" is NOT verification — it's the screening tool describing itself. "The kong.yml route definition has no plugin attachment" IS verification.
+
+## Refuted findings are successes
+
+When the model flags a structural lead and investigation confirms the controls hold, that's the system working correctly. The model identified a structurally interesting area. The investigation verified the defense. The output is a documented, defensible statement.
+
+A system that only values confirmed vulnerabilities incentivizes the model to be conservative. A system that values refuted findings incentivizes comprehensive exploration — investigate everything structurally interesting, document both gaps and defenses.
+
+## Principles
+
+1. **Energy scores are input to investigation, never output.** They tell you where to look. The investigation produces a security assessment grounded in code, config, and cloud state — not energy values.
+
+2. **The model tells you where to look, not what to conclude.** Energy signals are accurate descriptions of graph topology. They are not security assessments. A low-energy path through an auth flow is the happy path working correctly, not a vulnerability.
+
+3. **Translation is validation.** Every energy score must become a concrete security statement. "Entry energy is 0.03" is meaningless — "this service accepts TCP connections directly from the internet with no TLS termination" is actionable. The act of translating IS the investigation.
+
+4. **Neighborhood before paths.** Start from the user's concern, find relevant nodes, explore their neighborhood with granular tools. Wide-net enumeration misses controls one hop off the path.
+
+5. **Never surface model internals.** No energy scores, momentum values, graph node IDs, collapse ratios, or methodology sections in user-facing output.
+
+6. **No tickets until user sign-off.** Skills never create tickets automatically. The flow is: investigate → present findings → user reviews and approves → user creates tickets through their native ticketing integration. Reference the ticketing integration saved in the user's profile.
+
+## Session Start
+
+```
+triage_load_user()
+triage_list_projects()
+```
+
+**Profile exists:** Greet by name. List all projects with `triage_list_projects`. Show a one-line status per project (open/fixed/mitigated counts). Then **stop and ask the user** — do NOT proceed automatically:
+
+**"You have [N] active project(s): [names]. Want to continue on one of these, start a new project for different infrastructure, or explore something specific?"**
+
+**Profile not found but `available_users` returned:** Call `triage_load_user(name=<first_available_user>)` to load that profile instead. Then proceed as "Profile exists" above.
+
+**No profile and no available users:** This is onboarding. Follow the onboarding sequence.
+
+**After project selection or creation:**
+
+```
+load_graph_energies(branch_id)
+```
+
+Use `list_repositories` and `list_branches(repo_id)` to help users find their branch ID if needed. No graph → route to `/map`.
+
+## Onboarding
+
+Gather context in two passes — first the user, then the project. Conversational, not an interrogation.
+
+### User profile (ask once, persists forever)
+
+Ask: **"What's your name, your role, and what's your biggest security headache right now?"**
+
+Then: **"Who else needs to see the results? For each person — what's their role, what do they do when they receive security information, and do they know security jargon or should I keep it plain?"**
+
+Then: **"What ticketing integration do you have set up? For example: Linear, Jira, GitHub Issues — whatever you use to create tickets."**
+
+Save with `triage_save_user`: `name`, `role`, `org`, `pain_points`, `ticketing_integration`, `team` (each with name/role/needs/jargon_level).
+
+### Project setup (per engagement)
+
+Ask: **"What graph and findings should I work with?"** Get:
+- **Branch ID** — use `list_repositories` and `list_branches(repo_id)` to find it. No graph → route to `/map`.
+- Findings file paths — for each: scanner name, scanner version, scan date.
+
+Then ask: **"What tools and access do you have that could help verify findings? For example: GitHub org for source code, cloud CLI access (AWS/Azure/GCP), kubectl contexts, IaC repos, security tools, documentation — anything an investigator would reach for."**
+
+Capture each as a verification channel:
 ```json
 {
-  "items": [
-    {
-      "path_id": "path_abc123",
-      "entry_node": "public-api-gateway",
-      "target_node": "production-database",
-      "step_count": 4,
-      "risk_score": 82.5,
-      "difficulty": "easy",
-      "mitre_techniques": ["T1190", "T1078", "T1552"],
-      "status": "new",
-      "source": "unconstrained",
-      "repository_id": "repo_xyz",
-      "branch_id": "branch_main",
-      "created_at": "2026-06-20T14:30:00Z"
-    }
-  ],
-  "total": 12,
-  "limit": 20,
-  "offset": 0
+  "type": "source_code | cloud_cli | kubernetes | iac | security_tool | documentation | other",
+  "method": "github_api | local_path | cli | api | mcp",
+  "access": { ... },
+  "scope": "description of what's reachable",
+  "instructions": "How agents should use this — specific commands, API patterns, auth context"
 }
 ```
 
-`triage_stats` returns:
-```json
-{
-  "total": 47,
-  "by_status": {
-    "new": 12,
-    "acknowledged": 5,
-    "validating": 2,
-    "validated": 8,
-    "ticketed": 10,
-    "closed": 7
-  },
-  "by_severity": { ... },
-  "by_repository": { ... }
-}
-```
+Don't assume access methods. Don't assume local files are current. Don't assume the audit target list is exhaustive — ask about the full scope.
 
-Present a summary: "12 new paths, 47 total. 8 validated, 10 ticketed, 7 closed."
+Then: **"Is this multi-tenant or single-tenant? Managed service or self-hosted?"** and **"What do you need out of this? What decisions are you trying to make?"**
 
-Sort the queue by `risk_score` descending (highest risk first).
+Save with `triage_save_project`: `branch_id`, `sources`, `verification_channels`, `deployment_model`, `audiences`, `user_context`.
 
-### Step 2 — Walk each path
+Load the graph: `load_graph_energies(branch_id)`.
 
-For each path in the queue (highest `risk_score` first):
+## Pipeline Orchestration
 
-**2a. Load full details.** Call `get_attack_path(path_id)`.
+The pipeline runs linearly across seven phases, with agents running in **parallel within each phase**.
 
-Returns the full `TriagePath` object:
-```json
-{
-  "path_id": "path_abc123",
-  "entry_node": "public-api-gateway",
-  "target_node": "production-database",
-  "steps": [
-    {
-      "source_node": "public-api-gateway",
-      "target_node": "auth-service",
-      "edge_type": "exploits",
-      "tactic": "initial_access",
-      "technique": "T1190",
-      "description": "Exploit public-facing application"
-    }
-  ],
-  "step_count": 4,
-  "risk_score": 82.5,
-  "difficulty": "easy",
-  "mitre_techniques": ["T1190", "T1078", "T1552", "T1210"],
-  "status": "new",
-  "validation_run_id": null,
-  "validation_verdict": null,
-  "source": "unconstrained",
-  "repository_id": "repo_xyz",
-  "branch_id": "branch_main"
-}
-```
+Call `triage_get_workflow_args(project_id)` to validate, present configuration for user confirmation.
+Launch `Workflow({ name: "triage-pipeline", args: <validated args> })`.
 
-**2b. Present the path.** Show:
-- Entry → Target with step count
-- Risk score and difficulty (see "How to read difficulty scores" below)
-- MITRE techniques (list technique IDs with brief names)
-- Each step: source → target, edge type, tactic/technique, description
+The workflow handles phase orchestration, model selection per phase (Opus for discovery/investigation/delivery, Sonnet for grouping/sweep, Haiku for routing), structured output schemas, and parallel agent scheduling within each phase.
 
-**2c. Ask the user what to do.**
+## Three Activities
 
-| Action | Tool call | When to use |
-|--------|----------|-------------|
-| **Validate** | `validate_path(path_id)` | Path looks plausible, send to sandbox for real exploit attempt |
-| **Acknowledge** | `update_path_status(path_id, "acknowledged")` | Path is real but not urgent, mark as seen |
-| **Dismiss** | `dismiss_path(path_id, reason="...", note="...")` | False positive or acceptable risk. Ask for a reason. |
-| **Override score** | `override_risk_score(path_id, risk_score, reason)` | User believes risk is higher/lower than model scored |
-| **Comment** | `add_path_comment(path_id, author, text)` | Annotate investigation notes or decisions |
-| **Ticket** | (use `/remediate`) | Path is validated and needs a remediation ticket |
-| **Skip** | (no call) | Move to next path without changing status |
+### 1. Triage at scale
 
-### Step 3 — Monitor validation
+Before running the pipeline:
 
-When the user chooses **Validate**:
+1. Call `triage_get_workflow_args` to validate and check for gaps.
+2. Present any gaps with their questions. Save answers before proceeding.
+3. Ask investigation depth: "Investigate all groups, or cap it?" Confirm back.
+4. **Confirm settings before launch.** Present the full configuration:
+   - **Branch:** branch_id and node/edge count
+   - **Sources:** each findings file with scanner name
+   - **Audiences:** who receives output
+   - **Verification channels:** type, method, instructions for each. **Check for mismatches** — if method says `local_path` but instructions say "use GitHub API", flag it. If no channels are configured, that's a blocker.
+   - **Investigation depth** and **deployment model**
 
-1. Call `validate_path(path_id)`. Returns the updated `TriagePath` with `status: "validating"` and `validation_run_id`.
+   Ask: **"These are the settings I'll run with. Anything to change?"** Wait for confirmation.
+5. Launch the pipeline — see Pipeline Orchestration above.
 
-2. Tell the user: "Validation dispatched. This dispatches to sandbox validation, which attempts the exploit steps and independently verifies the result. This typically takes 5-15 minutes."
+**Resume on failure:** `Workflow({scriptPath: "<path>", resumeFromRunId: "<runId>"})`. Cached agents replay; only failed/new steps re-run.
 
-3. Poll `get_validation_status(run_id)` every 45 seconds.
+### 2. Validate a structural lead
 
-   `get_validation_status` returns:
-   ```json
-   {
-     "run_id": "val_run_abc123",
-     "status": "running",
-     "total_steps": 4,
-     "steps_completed": 2,
-     "steps_exploitable": 1,
-     "steps_dead_end": 1,
-     "current_step": 3,
-     "current_phase": "exploit_attempt"
-   }
-   ```
+Interactive single-finding investigation using energy tools. Start with the finding, anchor it in the graph, explore its neighborhood, and verify against real code/config.
 
-   Status progression: `pending` → `running` → `completed` | `failed`
+1. Anchor the finding to a graph node using `grep_nodes` or `find_nodes_by_type`
+2. Explore with `energy_node_scores`, `energy_node_neighborhood`, `energy_lowest_hop`
+3. Trace paths with `energy_trace_to_target`, `energy_momentum_path`
+4. Verify using the configured verification channels — read the actual implementation
+5. Produce a verdict: confirmed, refuted, or partial — with evidence from code/config, not the graph
 
-   While running, report: "Step 2/4 completed (1 exploitable, 1 dead end). Currently on step 3, exploit agent active."
+Save with `triage_update_finding_group`. Validated findings carry higher authority than raw scanner output.
 
-4. When `status` is `completed`:
-   - If `steps_exploitable > 0`: "Validation confirmed: N of M steps are exploitable. The path is real." The triage service automatically moves the path to `validated`.
-   - If `steps_dead_end == total_steps`: "All steps are dead ends. The path is not currently exploitable." The path moves to `validated` with a dead-end verdict.
+### 3. Explore interactively
 
-5. When `status` is `failed`: "Validation failed (sandbox error). The path remains in 'validating' and the reconciler will retry automatically."
+Free-form energy tool exploration. Use energy tools starting granular and widening:
+- Start with `energy_node_scores` on a specific area of interest
+- Expand with `energy_node_neighborhood` to see local context
+- Trace specific paths with `energy_trace_to_target`
+- Get the big picture with `energy_top_attack_paths`, `energy_chokepoints`, `energy_entry_points`
 
-6. After validation completes, ask the user whether to **create a remediation ticket** (→ `/remediate`) or **continue** to the next path.
+### Reframing
 
-### Step 4 — Track progress
+When the user reframes their understanding ("patch everything" → "what actually matters given our controls"), update `user_context`. The same graph supports different interpretations.
 
-After each action, show the remaining count: "11 new paths remaining."
+## Delivering to Audiences
 
-When the queue is empty or the user wants to stop, show a session summary:
-- Paths reviewed: N
-- Validated: N (M exploitable, K dead end)
-- Acknowledged: N
-- Dismissed: N
-- Ticketed: N
-- Skipped: N
+For each audience ask: what they do with security info, what the report should look like, what makes it less useful. Save as `report_outline` and `not_include`.
 
-### Next steps
+**Reports:**
+- Action table first
+- Dismissed items are high-value — document the control and why it holds
+- Separate remediation-ready from investigation-needed
+- Blast radius with deployment model context
+- Cite code/config evidence, not graph properties
+- Define jargon inline when audience needs it
+- Reference the user's native ticketing integration for creating work items
 
-After completing triage:
-- "Want to create remediation tickets?" → `/remediate`
-- "Want to investigate a specific path deeper?" → `/investigate` with the path's entry node or target
-- "Want to explore the graph around a finding?" → `/explore`
-- "Want to find more paths proactively?" → `/research`
-- "Want to set up monitoring for new paths?" → `/monitor`
-- "Want to process scanner output against this graph?" → `/triage-report`
+**Never include:** energy scores, node IDs, collapse ratios, methodology, tool comparisons, effort/timeline estimates, review dates (user sets those).
 
-## How to read risk scores and difficulty
+Use `triage_add_work_item` for engineering actions. `triage_add_decision` for risk acceptance.
 
-**Risk scores are 0–100** (momentum model). They integrate per-hop energy along the path. The bands have real meaning:
-- **0–20**: strong structural resistance. Most hops brake. Infrastructure is well-defended here.
-- **20–40**: moderate resistance. Mixed signal — investigate what's braking.
-- **40–60**: low resistance. Multiple accelerating hops. Deserves attention.
-- **60–80**: little resistance. Most hops accelerate. High priority.
-- **80–100**: almost no resistance across the path.
+## Resolution Categories
 
-A score of 15 means the infrastructure is well defended on this path. If all paths in the queue score under 20, the conclusion is "well defended" — dismiss or acknowledge these paths. Focus attention on paths scoring 40+.
+- **eliminable** — clear fix, no trade-off → engineering
+- **reducible** — partial fix, add controls → engineering
+- **constrained** — design limitation → product decision
+- **drift_prone** — recurring → automation/monitoring
+- **mitigated** — fix friction > risk under existing controls → accept with review date
 
-**Difficulty labels** (trivial/easy/medium/hard/extreme) describe attacker economics, not skill requirements. "Easy" means an attacker (human or AI) would continue along this path rather than pivoting. "Extreme" means the structural resistance makes pivoting more rational.
+## Energy Signal Reference
 
-**Per-hop energy** (visible in the full path report): negative = accelerating (low resistance), positive = braking (control detected). When you see braking energy, the path description often identifies the specific control.
+**Entry energy** — structural exposure. Lower = more reachable from external input. Not just network endpoints — K8s reconcile events, client SDK inputs, CI triggers all count.
+- < 0.1: directly accessible. 0.1-0.5: entry-facing. 0.5-2.0: near-surface. 2.0-4.0: interior. > 4.0: deep interior.
 
-## How to read MITRE techniques
+**Transition energy** — per-edge resistance. Negative = accelerating (easy), positive = braking (barrier).
+- Edge type patterns: `contains`/`calls` accelerate. `owns`/`member_of` brake. `has_permission`/`assumes_role` 100% accelerate. `protects`: 76% brake, 24% accelerate — an accelerating `protects` edge means the model sees the control as structurally transparent. Most reliable signal for investigation.
 
-Common techniques you'll see in attack paths:
+**Momentum** — cumulative path score integrating per-hop energy. Risk score 0-100.
+- 0-20: strong structural resistance. Infrastructure is well defended. Not a finding.
+- 20-40: moderate resistance. Mixed signal — investigate what's braking.
+- 40-60: low resistance. Multiple accelerating hops. Deserves attention.
+- 60-80: little resistance. Most hops accelerate. High priority.
+- 80-100: almost no resistance across the path.
 
-| ID | Name | Category |
-|----|------|----------|
-| T1190 | Exploit Public-Facing Application | Initial Access |
-| T1078 | Valid Accounts | Persistence / Privilege Escalation |
-| T1552 | Unsecured Credentials | Credential Access |
-| T1210 | Exploitation of Remote Services | Lateral Movement |
-| T1068 | Exploitation for Privilege Escalation | Privilege Escalation |
-| T1048 | Exfiltration Over Alternative Protocol | Exfiltration |
+**The key rule:** Low resistance does not equal security problem. Authorized flows accelerate by design. The signal is low resistance WHERE IT SHOULD NOT BE.
 
-Full mapping at https://attack.mitre.org/techniques/enterprise/.
+**Implicit vs explicit edges:** Explicit edges (confirmed in the graph) have smaller energy magnitudes. Implicit edges (model-inferred, not confirmed) have much larger magnitudes. Never compare them on the same scale.
 
-## What validation actually does
+**Model strengths:** Structural transparency in controls, co-location anti-patterns, missing boundaries, chokepoints.
 
-Validation dispatches to sandbox validation, which attempts the exploit steps and independently verifies the result. Each step runs in an isolated sandbox container with controlled egress. The verdict for each step is one of: `approved` (exploit confirmed), `rejected` (could not reproduce), or `dead_end` (step is not feasible).
+**Model blind spots:** Runtime behavior (RLS, RBAC), cryptographic backing of checks, protocol-layer auth.
 
-## Error handling
+## Graph Tools
 
-| Error | Cause | Fix |
-|-------|-------|-----|
-| 401 Unauthorized | API key invalid | Regenerate in portal |
-| 404 Not Found on `get_attack_path` | Path was deleted or ID is wrong | Re-query with `list_attack_paths` |
-| 422 on `update_path_status` | Invalid status transition (e.g. `new` → `ticketed` without validation) | Follow the status machine: new → acknowledged/validating/closed |
-| 502 on `validate_path` | Validator service unreachable | Check deployment health; the reconciler will retry automatically |
-| 422 on `dismiss_path` | Path not in acknowledged or validated state | Check current status with `get_attack_path`; transition first if needed |
-| 422 on `override_risk_score` | risk_score outside 0–100 | Clamp value to [0, 100] before calling |
+- `read_node(name)`, `read_edge(name)`, `get_connected_edges(node, direction)` — read specific graph elements
+- `grep_nodes(pattern, field, limit)`, `grep_edges(pattern, field, limit)` — search by substring
+- `find_nodes_by_type(node_type, limit)`, `find_edges_by_type(edge_type, limit)` — search by type
+- `get_graph_statistics()` — node/edge counts and type distributions
+
+## Energy Tools
+
+**Granular** (start here):
+- `energy_node_scores(node_query)` — what is this node, what's connected
+- `energy_lowest_hop(node_query)` — single least-resistance connection
+- `energy_node_neighborhood(node_query, hops)` — local context including nearby controls
+- `energy_edge_scores(source_query, target_query)` — specific connection energies
+
+**Exploration** (after understanding the neighborhood):
+- `energy_lowest_paths(node_query, max_hops, top_k)` — lowest-energy paths at each depth
+- `energy_trace_to_target(source_query, target_query)` — least-resistance route between two points
+- `energy_compare_paths(path_a, path_b)` — why one route is less defended
+- `energy_momentum_path(node_names)` — momentum along a specific path
+
+**Structural overview** (broad picture):
+- `energy_top_attack_paths(limit)` — highest-momentum paths
+- `energy_chokepoints(limit)` — nodes with most path flow
+- `energy_entry_points(threshold, limit)` — exposed surface
+- `energy_defenses(limit)` — structural resistance nodes
+
+## State Management
+
+- `triage_save_user` / `triage_load_user` — identity, role, pain points, ticketing integration, team
+- `triage_save_project` / `triage_load_project` / `triage_list_projects` — project lifecycle
+- `triage_project_status` — current state summary
+- `triage_update_finding_group` — mark findings fixed/mitigated/deferred, record verdicts
+- `triage_add_work_item` — create actionable items assigned to people
+- `triage_add_decision` — record risk decisions with justification and review dates
+- `triage_get_workflow_args` — validated args for the pipeline
+
+## Path Submission
+
+Use `submit_attack_path` to submit discovered paths for scoring.
+
+**Commit state after every significant action.** Work must survive session boundaries.

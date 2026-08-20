@@ -1,4 +1,4 @@
-"""Tests for bulk_update_paths default status-filter behaviour (LD-2001).
+"""Tests for bulk_update_paths default status-filter behaviour.
 
 Verifies that each action defaults to its action-compatible source statuses
 when no status_filter is supplied, preventing predictable state-machine failures.
@@ -6,7 +6,7 @@ when no status_filter is supplied, preventing predictable state-machine failures
 
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import latent_defense_mcp.server as srv
 

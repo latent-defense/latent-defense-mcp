@@ -7,7 +7,7 @@ name = "latent-defense-mcp"
 version = "0.1.0"
 description = "MCP server for the Latent Defense infrastructure security platform — map repos, discover attack paths, triage findings."
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+license = { text = "Proprietary" }
 authors = [{ name = "Latent Defense", email = "eng@latentdefense.ai" }]
 readme = "README.md"
 keywords = ["mcp", "security", "infrastructure", "attack-paths", "jepa"]
@@ -38,7 +38,13 @@ latent-defense-mcp-login = "latent_defense_mcp.login:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["latent_defense_mcp"]
-artifacts = ["latent_defense_mcp/skills/**/*.md"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# Bundle skills inside the package so init.py can find them after pip install.
+# .claude/skills/ has symlinks to shared skills + real Claude-specific dirs;
+# hatch follows symlinks by default so the resolved files ship in the wheel.
+".claude/skills" = "latent_defense_mcp/skills/claude"
+".cursor/skills" = "latent_defense_mcp/skills/cursor"
 
 [dependency-groups]
 dev = [

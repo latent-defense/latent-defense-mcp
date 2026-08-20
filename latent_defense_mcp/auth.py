@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import platform
 import stat
 import sys
@@ -478,3 +477,5 @@ class TokenManager:
         if self._access_token_expiry is None:
             return False
         return datetime.now(UTC) + _EXPIRY_BUFFER < self._access_token_expiry
+
+# cmv2 webhook e2e probe

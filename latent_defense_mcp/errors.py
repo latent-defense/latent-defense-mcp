@@ -32,8 +32,7 @@ class McpApiError(Exception):
     error did not come from an HTTP response). Callers should branch on
     ``status`` — e.g. an expected 404 on a best-effort leg — rather than
     matching the message text, which changes when :func:`handle_response`
-    prefers the structured error envelope over the per-status message
-    (review: claude[bot], LD-2255).
+    prefers the structured error envelope over the per-status message.
     """
 
     def __init__(self, message: str, *, status: int | None = None) -> None:
@@ -55,14 +54,12 @@ TOOL_SCOPES: dict[str, str] = {
     "list_branches": "infra:read",
     "get_branch": "infra:read",
     "get_graph": "infra:read",
-    "list_branch_attack_paths": "infra:read",
     "create_branch": "infra:write",
     "list_commits": "infra:read",
     "diff_commits": "infra:read",
     "search_nodes": "infra:read",
     "infra_stats": "infra:read",
     # Scanning
-    "trigger_scan": "map:trigger",
     "list_trigger_events": "map:read",
     "trigger_stats": "map:read",
     "list_scan_schedules": "map:read",
@@ -85,7 +82,6 @@ TOOL_SCOPES: dict[str, str] = {
     "delete_inference_schedule": "inference:configure",
     # Attack path triage
     "list_attack_paths": "triage:read",
-    "paths_through_node": "triage:read",
     "get_attack_path": "triage:read",
     "update_path_status": "triage:write",
     "validate_path": "triage:write",
@@ -97,10 +93,11 @@ TOOL_SCOPES: dict[str, str] = {
     "add_path_comment": "triage:write",
     "edit_path_comment": "triage:write",
     "list_path_history": "triage:read",
-    "list_path_comments": "triage:read",
+    "submit_attack_path": "triage:write",
     "triage_stats": "triage:read",
     "get_triage_config": "triage:read",
-    "get_classification_stats": "triage:read",
+    # Validation
+    "get_validation_status": "triage:read",
     # Webhooks
     "register_webhook": "webhooks",
     "list_webhooks": "webhooks",
@@ -108,25 +105,6 @@ TOOL_SCOPES: dict[str, str] = {
     "test_webhook": "webhooks",
     "webhook_deliveries": "webhooks",
     "validate_webhook_template": "webhooks",
-    # Validation
-    "get_validation_status": "triage:read",
-    # Remediation tickets
-    "list_tickets": "tickets:read",
-    "get_ticket": "tickets:read",
-    "ticket_stats": "tickets:read",
-    "create_remediation_ticket": "tickets:write",
-    "get_ticket_steps": "tickets:read",
-    "update_ticket_status": "tickets:write",
-    "sync_ticket": "tickets:write",
-    "retry_ticket": "tickets:write",
-    # Ticket provider configuration
-    "get_ticket_provider": "tickets:read",
-    "configure_ticket_provider": "tickets:configure",
-    "test_ticket_provider": "tickets:configure",
-    "set_active_ticket_provider": "tickets:configure",
-    "remove_ticket_provider": "tickets:configure",
-    "get_ticket_template_variables": "tickets:read",
-    "preview_ticket_template": "tickets:configure",
     # Data source connectors
     "list_connectors": "connectors:read",
     "create_connector": "connectors:write",
@@ -138,26 +116,41 @@ TOOL_SCOPES: dict[str, str] = {
     "ingest_stats": "connectors:read",
     "test_connector": "connectors:write",
     "connector_health": "connectors:read",
-    # Graph analysis (oracle)
-    "oracle_load_branch": "oracle",
-    "oracle_load_status": "oracle",
-    "oracle_wait_for_load": "oracle",
-    "oracle_graph_info": "oracle",
-    "oracle_list_nodes": "oracle",
-    "oracle_get_node": "oracle",
-    "oracle_search_nodes": "oracle",
-    "oracle_tm_add_node": "oracle",
-    "oracle_tm_add_edge": "oracle",
-    "oracle_tm_show": "oracle",
-    "oracle_tm_clear": "oracle",
-    "oracle_tm_match": "oracle",
-    "oracle_tm_match_refine": "oracle",
-    "oracle_submit_attack_path": "oracle",
-    "oracle_submit_matched_path": "oracle",
-    "oracle_tm_list_templates": "oracle",
-    "oracle_tm_load_template": "oracle",
-    "oracle_tm_save": "oracle",
-    "oracle_reset_session": "oracle",
+    # Energy analysis + graph cache
+    "load_graph_energies": "oracle",
+    "load_branch": "oracle",
+    "wait_for_load": "oracle",
+    "read_node": "oracle",
+    "read_edge": "oracle",
+    "get_connected_edges": "oracle",
+    "get_graph_statistics": "oracle",
+    "grep_nodes": "oracle",
+    "grep_edges": "oracle",
+    "find_nodes_by_type": "oracle",
+    "find_edges_by_type": "oracle",
+    "energy_node_scores": "oracle",
+    "energy_edge_scores": "oracle",
+    "energy_momentum_path": "oracle",
+    "energy_lowest_hop": "oracle",
+    "energy_lowest_paths": "oracle",
+    "energy_trace_to_target": "oracle",
+    "energy_compare_paths": "oracle",
+    "energy_node_neighborhood": "oracle",
+    "energy_entry_points": "oracle",
+    "energy_defenses": "oracle",
+    "energy_top_attack_paths": "oracle",
+    "energy_chokepoints": "oracle",
+    # Triage state (local persistence, no scope required)
+    "triage_save_user": "",
+    "triage_load_user": "",
+    "triage_save_project": "",
+    "triage_load_project": "",
+    "triage_list_projects": "",
+    "triage_project_status": "",
+    "triage_update_finding_group": "",
+    "triage_add_work_item": "",
+    "triage_add_decision": "",
+    "triage_get_workflow_args": "",
     # Introspection (no scope required)
     "whoami": "",
     "connection_status": "",
@@ -275,7 +268,7 @@ def _raise_for_response(
     if status >= 500:
         body = _sanitize_error(response.text)
         if "no graph loaded" in body.lower():
-            raise McpApiError("No graph is loaded. Call oracle_load_branch() first.")
+            raise McpApiError("No graph is loaded. Call load_graph_energies() first.")
         raise McpApiError(
             f"Server error ({status}). The deployment may be unhealthy.\n"
             "Run connection_status() to check service health."

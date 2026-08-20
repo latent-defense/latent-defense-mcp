@@ -302,19 +302,19 @@ const INVESTIGATE_VERIFY_SCHEMA = {
 // Phase 1: Load graph
 // ═══════════════════════════════════════════════════════════════
 phase('Load')
-log('Loading graph via oracle (triggers JEPA encoding with progress)...')
+log('Loading graph (triggers JEPA encoding with progress)...')
 const loadResult = await agent(`
 Load the infrastructure graph for energy analysis. This is a two-step process:
 
-Step 1: Warm the inference cache via oracle.
-ToolSearch query="select:mcp__latent-defense__oracle_load_branch,mcp__latent-defense__oracle_wait_for_load" max_results=2
-Call oracle_load_branch("${branchId}").
-Then call oracle_wait_for_load(timeout_secs=600, poll_interval=15) to block until encoding completes.
+Step 1: Warm the inference cache and wait for encoding.
+ToolSearch query="select:mcp__latent-defense__load_branch,mcp__latent-defense__wait_for_load" max_results=2
+Call load_branch("${branchId}").
+Then call wait_for_load(timeout_secs=600, poll_interval=15) to block until encoding completes.
 
 Step 2: Load the energy scores into the local cache.
 ToolSearch query="select:mcp__latent-defense__load_graph_energies" max_results=1
 Call load_graph_energies("${branchId}").
-This fetches the pre-computed energy scores (instant after oracle loads).
+This fetches the pre-computed energy scores (instant after encoding completes).
 
 Report the node count, edge count, and whether energies loaded (has_energies).
 `, { label: 'load-graph', phase: 'Load', model: 'sonnet', schema: {
@@ -353,9 +353,14 @@ for (const c of discoverResult.clusters) log(`  ${c.id}: ~${c.estimated_findings
 // ═══════════════════════════════════════════════════════════════
 phase('Group')
 
-const claimedGlobal = new Set()
-const allGroups = []
-const allCrossRefs = []
+// NOTE: allGroups and allCrossRefs are populated inside parallel() callbacks.
+// Completion order is non-deterministic (LLM latency on first run, instant cache
+// on resume). To make downstream prompts cache-stable across resumes:
+// 1. Store RAW claimed_findings from agents (no filtering during parallel)
+// 2. After parallel completes, sort by group_id (deterministic)
+// 3. Deduplicate claims with deterministic tie-breaking (alphabetical group_id wins)
+const allGroupsRaw = []
+const allCrossRefsRaw = []
 
 async function refineCluster(cluster, depthRemaining, parentPath) {
   const clusterId = `${parentPath}/${cluster.id}`
@@ -382,11 +387,11 @@ List EXACT 0-based indices in claimed_findings. Report cross_refs for other clus
 
   if (!result) { log(`  Warning: ${clusterId} null`); return }
 
-  const newClaims = (result.claimed_findings || []).filter(idx => !claimedGlobal.has(idx))
-  const doubles = (result.claimed_findings || []).filter(idx => claimedGlobal.has(idx))
-  if (doubles.length > 0) log(`  Warning: ${clusterId} double-claimed ${doubles.length}`)
-  for (const idx of newClaims) claimedGlobal.add(idx)
-  if (result.cross_refs) for (const cr of result.cross_refs) allCrossRefs.push({ ...cr, source_group: clusterId })
+  // Store RAW claims — deduplication happens after parallel() completes
+  const rawClaims = result.claimed_findings || []
+  if (result.cross_refs) {
+    for (const cr of result.cross_refs) allCrossRefsRaw.push({ ...cr, source_group: clusterId })
+  }
 
   if (result.energy_analysis) {
     const ea = result.energy_analysis
@@ -394,21 +399,41 @@ List EXACT 0-based indices in claimed_findings. Report cross_refs for other clus
   }
 
   if (result.is_leaf || depthRemaining <= 1) {
-    allGroups.push({ ...result, group_id: clusterId, claimed_findings: newClaims, depth: maxDepth - depthRemaining })
-    log(`  Leaf: ${clusterId} claimed ${newClaims.length}`)
+    allGroupsRaw.push({ ...result, group_id: clusterId, claimed_findings: rawClaims, depth: maxDepth - depthRemaining })
+    log(`  Leaf: ${clusterId} claimed ${rawClaims.length}`)
   } else if (result.children?.length > 0) {
     log(`  Split: ${clusterId} → ${result.children.length} children`)
-    if (newClaims.length > 0) {
-      allGroups.push({ ...result, group_id: `${clusterId}/claimed`, is_leaf: true, claimed_findings: newClaims, children: [], depth: maxDepth - depthRemaining })
+    if (rawClaims.length > 0) {
+      allGroupsRaw.push({ ...result, group_id: `${clusterId}/claimed`, is_leaf: true, claimed_findings: rawClaims, children: [], depth: maxDepth - depthRemaining })
     }
     await parallel(result.children.map(child => () => refineCluster(child, depthRemaining - 1, clusterId)))
   } else {
     log(`  Warning: ${clusterId} is_leaf=false but no children, forcing leaf`)
-    allGroups.push({ ...result, group_id: clusterId, is_leaf: true, claimed_findings: newClaims, depth: maxDepth - depthRemaining })
+    allGroupsRaw.push({ ...result, group_id: clusterId, is_leaf: true, claimed_findings: rawClaims, depth: maxDepth - depthRemaining })
   }
 }
 
 await parallel(discoverResult.clusters.map(cluster => () => refineCluster(cluster, maxDepth, '')))
+
+// ── Deterministic post-processing ──
+// Sort groups and cross-refs by group_id so downstream prompts are stable across resumes.
+allGroupsRaw.sort((a, b) => a.group_id.localeCompare(b.group_id))
+allCrossRefsRaw.sort((a, b) => `${a.source_group}:${a.finding_idx}`.localeCompare(`${b.source_group}:${b.finding_idx}`))
+
+// Deduplicate claims: when multiple groups claim the same finding, the group with
+// the lexicographically first group_id wins. This is deterministic regardless of
+// parallel completion order.
+const claimedGlobal = new Set()
+const allGroups = []
+for (const group of allGroupsRaw) {
+  const dedupedClaims = group.claimed_findings.filter(idx => !claimedGlobal.has(idx))
+  const doubles = group.claimed_findings.length - dedupedClaims.length
+  if (doubles > 0) log(`  Warning: ${group.group_id} double-claimed ${doubles} (resolved by group_id priority)`)
+  for (const idx of dedupedClaims) claimedGlobal.add(idx)
+  allGroups.push({ ...group, claimed_findings: dedupedClaims })
+}
+const allCrossRefs = allCrossRefsRaw
+
 log(`Grouping: ${allGroups.length} leaf groups, ${claimedGlobal.size} claimed`)
 
 // ═══════════════════════════════════════════════════════════════
@@ -520,6 +545,7 @@ ${JSON.stringify({ id: group.group_id, title: group.annotation?.title, findings:
 )
 
 const verified = investigated.filter(Boolean)
+log(`Verified: ${verified.length}/${toInvestigate.length}`)
 
 // ═══════════════════════════════════════════════════════════════
 // Phase 6: Route remaining

@@ -1,7 +1,7 @@
-"""LD-2258 (WS-E / E6): the `rescored` recently-re-scored filter is forwarded through
+"""Rescored filter: the `rescored` recently-re-scored filter is forwarded through
 the `list_attack_paths` MCP tool to GET /api/triage/paths.
 
-Contract mirrored verbatim from triage#107 (LD-2247 / C1a), as merged to triage main:
+Contract for the rescored query parameter:
     rescored: bool = Query(False)
     rescored_window_hours: int = Query(72, gt=0, le=8760)
 
@@ -121,11 +121,11 @@ class TestRescoredForward:
         assert p.get("rescored_window_hours") == 12
 
     async def test_scope_unchanged_triage_read(self):
-        """E6 adds no write scope — list_attack_paths stays triage:read."""
+        """Adding the filter requires no extra write scope — list_attack_paths stays triage:read."""
         from latent_defense_mcp.errors import TOOL_SCOPES
 
         assert TOOL_SCOPES["list_attack_paths"] == "triage:read"
 
     async def test_no_notifications_tool(self):
-        """WS-C C2 (LD-2249) was dropped — no notifications tool should exist."""
+        """Rescored filter (window hours) was dropped — no notifications tool should exist."""
         assert not hasattr(server, "list_wave_notifications")

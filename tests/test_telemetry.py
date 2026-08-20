@@ -12,7 +12,7 @@ Blocker fixes verified here:
 import asyncio
 import hashlib
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import latent_defense_mcp.telemetry as tel
 from latent_defense_mcp import server

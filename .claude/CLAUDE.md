@@ -4,7 +4,7 @@ Latent Defense maps infrastructure into a semantic graph and uses a learned ener
 
 ## How the world model works
 
-The JEPA model encodes your entire infrastructure graph — every node, every edge, every relationship — and learns the structural patterns that make attack paths possible. You interact with it through **threat model matching**: describe an abstract attack chain, and the model tells you which parts actually exist in your infrastructure and how much resistance each step presents.
+The JEPA model encodes your entire infrastructure graph — every node, every edge, every relationship — and learns the structural patterns that make attack paths possible. You interact with it through energy-based analysis: load the graph, discover what exists, and score how much resistance each path presents.
 
 ### Energy
 
@@ -41,9 +41,21 @@ Difficulty labels (trivial, easy, medium, hard, extreme) describe **attacker eco
 
 "Easy" means low structural resistance — an attacker (human or AI) would continue along this path rather than abandoning it. "Extreme" means high resistance — pivoting elsewhere is more rational.
 
+### Investigation method — Five Moves
+
+Every investigation follows five moves:
+
+1. **Ground** — find real nodes (`grep_nodes`, `find_nodes_by_type`)
+2. **Position** — understand structural role (`energy_node_scores`, `energy_node_neighborhood`)
+3. **Trace** — find paths (`energy_trace_to_target`, `energy_lowest_paths`)
+4. **Score** — evaluate risk (`energy_momentum_path`, 0-100 bands)
+5. **Verify** — check source code, config, cloud state
+
+Energy scores tell you WHERE to look. They are the input to investigation, never the output.
+
 ### Compensating controls
 
-When the model shows braking energy on a hop, it detected a structural barrier. Use `oracle_get_node` on both endpoints to identify the specific control — a security boundary, an auth check, a network policy. The model finds defenses, not just risks.
+When the model shows braking energy on a hop, it detected a structural barrier. Use `read_node` on both endpoints to identify the specific control — a security boundary, an auth check, a network policy. The model finds defenses, not just risks.
 
 Always look for the control's **limitations** in the node description. The graph often captures both what a control does AND its gaps (e.g., "sandbox restricts filesystem but VCA retains network access to localhost").
 
@@ -70,64 +82,69 @@ Type `/latent-defense` for guided navigation, or invoke any skill directly:
 
 | Skill | When to use |
 |-------|-------------|
-| `/tutorial` | First time using the product. Interactive walkthrough of the graph, energy, risk scores, and how to read the model's signals using your own infrastructure. |
-| `/my-data` | See everything in your deployment — all graphs, branches, attack paths, scans, schedules, connectors. Start here to find which graph to work with. |
-| `/explore` | Explore your infrastructure graph — find entry points, crown jewels, choke points, security boundaries, and credential surfaces. |
-| `/investigate` | Investigate a specific CVE, detection, alert, or finding against your graph. Enriches one finding with attack chain context and the model's structural assessment. |
-| `/triage-findings` | Structural security triage. Groups scanner findings by remediation action, investigates each against the graph using energy analysis, and produces audience-specific reports. Supports the full lifecycle: onboarding → project setup → pipeline → delivery. Uses `load_graph_energies` for local SQLite-backed queries and the `triage-pipeline` workflow for scale. |
-| `/triage-report` | Process an entire scanner report (Trivy, Checkov, Semgrep, Bandit). Produces a comprehensive table mapping every finding to the model's assessment with resolution status. For 50+ findings, delegates to the `triage-pipeline` workflow. |
-| `/triage` | Walk the attack path triage queue interactively. |
-| `/research` | Proactive attack path discovery. Explore the graph, build threat models, test hypotheses, and discover paths no scanner flagged. |
-| `/review-paths` | Review existing attack paths in the triage queue. Understand risk scores in context, update statuses, escalate or dismiss. |
-| `/rerun-inference` | Re-run JEPA inference on a graph after model updates, remapping, or remediation. See how the security posture changed. |
-| `/diff` | Compare two graph snapshots — what was added, removed, modified between commits or branches. |
-| `/map` | Map new infrastructure — repositories, cloud accounts, Kubernetes clusters, domains, CIDRs. |
-| `/remediate` | Create remediation tickets for validated attack paths. |
-| `/monitor` | Set up recurring scans, inference schedules, and webhook alerts. |
-| `/build` | Build automations and integrations with the API. Detection ingestion, webhooks, scan scheduling, integration patterns. |
-| `/siem` | Set up SIEM integration — export attack paths via polling (CEF syslog) or webhooks (HTTP push). Supports Splunk, Sentinel, Elastic, QRadar. |
-| `/status` | Quick deployment health check — service health, infrastructure stats, recent activity. |
-| `/health-check` | Deep deployment validation — auth, services, repos, connectors, ticketing. |
-| `/setup` | Set up the MCP server in a new project. Routes to `/setup-interactive` or `/setup-headless` based on environment. |
-| `/setup-interactive` | Interactive browser-based setup with device-flow OAuth. |
-| `/setup-headless` | Headless setup for CI/containers — token passed via environment variable. |
-| `/world-model-guide` | Reference on how the JEPA model works, how to interpret energy/risk, and how to build threat models. Context only, no actions. |
+| `/tutorial` | First time using the product. Interactive walkthrough of energy, risk scores, and path tracing. |
+| `/my-data` | See everything in your deployment. |
+| `/explore` | Browse infrastructure graph — entry points, crown jewels, choke points, credentials. |
+| `/investigate` | Investigate a specific CVE, detection, alert, or finding against your graph. |
+| `/triage` | Scanner finding triage at scale. Orchestrates parallel sub-agents in both Claude Code and Cursor. |
+| `/research` | Proactive attack path discovery. |
+| `/review` | Walk the attack path triage queue. Review, validate, dismiss paths. |
+| `/diff` | Compare two graph snapshots. |
+| `/map` | Map new infrastructure. |
+| `/rerun-inference` | Re-run JEPA inference after changes. |
+| `/build` | Integrations hub — webhooks, scan schedules, SIEM export, connectors. |
+| `/status` | Deployment health check. `/status deep` for full validation. |
 
 ## Workflows
 
 | Workflow | When to use |
 |----------|-------------|
-| `triage-pipeline` | Fan-out structural triage at scale. Seven phases: Load → Discover → Group → Sweep → Investigate → Route → Deliver. Invoked by `/triage-findings` for large finding sets. Each phase runs parallel agents operating against the shared energy graph cache. |
+| `triage-pipeline` | Fan-out structural triage at scale. Seven phases: Load → Discover → Group → Sweep → Investigate → Route → Deliver. Invoked by `/triage` for large finding sets. Each phase runs parallel agents operating against the shared energy graph cache. |
+
+Both Claude Code and Cursor support parallel sub-agents. In Claude Code, `/triage` can use the workflow for optimized orchestration (model selection per phase, structured output schemas). In Cursor, `/triage` orchestrates the same pipeline using sub-skills (`/triage-discover`, `/triage-investigate`, `/triage-deliver`) with parallel agents within each phase.
 
 ## Prompts
 
-Three agentic prompts expand into structured instructions for the calling agent:
+Eight agentic prompts expand into structured instructions for the calling agent:
 
 | Prompt | What it does |
 |--------|-------------|
-| `triage_queue_review` | Guided walkthrough of the triage queue — loads stats, filters by severity, walks each path with structural context. |
-| `assess_cve` | Assesses a CVE's exposure across the graph — finds affected nodes, traces attack paths through them, produces a risk summary. |
-| `chokepoint_report` | Identifies infrastructure chokepoints where many attack paths converge — ranks by path count and risk, recommends prioritized hardening. |
+| `triage_queue_review` | Walk the triage queue. |
+| `assess_cve` | Assess CVE exposure (uses energy tools). |
+| `chokepoint_report` | Find infrastructure chokepoints (uses `energy_chokepoints`). |
+| `investigate_finding` | Investigate a single finding using the Five Moves. |
+| `research_sweep` | Systematic attack path discovery. |
+| `triage_discover` | Cluster findings into remediation groups. |
+| `triage_investigate_group` | Investigate one finding group. |
+| `triage_deliver` | Generate an audience-specific report. |
 
 ## Energy graph cache
 
-`load_graph_energies(branch_id)` fetches the full graph from InfraDB and energy scores from the JEPA inference server into a local SQLite database (`~/.latent-defense/graph-cache/<branch>.db`). All graph read/search and energy analysis tools require this to be called first.
+`load_graph_energies(branch_id)` is the single entry point for all graph exploration and energy analysis. It fetches the full graph and energy scores from the inference server into a local SQLite database (`~/.latent-defense/graph-cache/<branch>.db`). All graph read/search and energy analysis tools require this to be called first.
 
-For large graphs (1000+ nodes), warm the server-side cache first: `oracle_load_branch` → `oracle_wait_for_load` → then `load_graph_energies`. The SQLite cache survives process restarts — subsequent loads are instant.
+For large graphs (1000+ nodes), `load_graph_energies` handles JEPA warm-up internally. The SQLite cache survives process restarts — subsequent loads are instant.
 
 **Graph tools** (8): `read_node`, `read_edge`, `get_connected_edges`, `get_graph_statistics`, `grep_nodes`, `grep_edges`, `find_nodes_by_type`, `find_edges_by_type`
 
 **Energy tools** (12): `energy_node_scores`, `energy_edge_scores`, `energy_momentum_path`, `energy_lowest_hop`, `energy_lowest_paths`, `energy_trace_to_target`, `energy_compare_paths`, `energy_node_neighborhood`, `energy_entry_points`, `energy_defenses`, `energy_top_attack_paths`, `energy_chokepoints`
 
-## Triage state
+## Session state
 
-Local filesystem persistence (`~/.latent-defense/triage-state/`) for cross-session triage projects and user profiles. State survives process restarts and works offline.
+Local filesystem persistence (`~/.latent-defense/triage-state/`) for cross-session user profiles and project state. State survives process restarts and works offline. Used by all investigation skills, not just triage.
 
-**User profiles**: `triage_save_user`, `triage_load_user` — identity, role, pain points, team context. Saved once, reused across all projects.
+### Profiles and projects
 
-**Projects**: `triage_save_project`, `triage_load_project`, `triage_list_projects`, `triage_project_status` — each project tracks one engagement with its branch, sources, audiences, findings, work items, and decisions.
+Every investigation skill loads user context and project state at session start.
+
+**User profiles** (`triage_save_user`, `triage_load_user`): identity, role, pain points, team, verification channels, ticketing integration. Persists forever.
+
+**Projects** (`triage_save_project`, `triage_load_project`): per-engagement state — branch, findings, verdicts, work items, decisions. Survives session boundaries.
 
 **Actions**: `triage_update_finding_group`, `triage_add_work_item`, `triage_add_decision`, `triage_get_workflow_args` — update status, assign work, record risk decisions, bridge into workflow execution.
+
+### Cursor compatibility
+
+Cursor 2.4+ reads `.claude/skills/` natively — all skills work in both Claude Code and Cursor. Both platforms support parallel sub-agents. The `/triage` skill orchestrates the pipeline with parallel agents within each phase on either platform: Claude Code uses the `triage-pipeline` workflow; Cursor uses sub-skills (`/triage-discover`, `/triage-investigate`, `/triage-deliver`) with parallel agent spawning.
 
 ## Interpreting results
 

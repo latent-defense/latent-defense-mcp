@@ -8,7 +8,8 @@ from __future__ import annotations
 import heapq
 import json
 import math
-from collections import Counter, defaultdict
+import time
+from collections import Counter
 from typing import Any, Callable
 
 from .energy_cache import EnergyGraphCache
@@ -30,7 +31,6 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
         if c is None or not c.loaded:
             return json.dumps({
                 "error": "No graph loaded. Load the graph first: "
-                "oracle_load_branch(branch_id) → oracle_wait_for_load() → "
                 "load_graph_energies(branch_id).",
             })
         if not c.has_energies:
@@ -38,8 +38,8 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
                 "error": "Graph loaded but energy scores are not available.",
                 "reason": c.energy_error or "Unknown",
                 "next_step": (
-                    "Warm the inference cache first: oracle_load_branch(branch_id) → "
-                    "oracle_wait_for_load(). Then retry load_graph_energies(branch_id)."
+                    "Retry load_graph_energies(branch_id) — it handles "
+                    "inference cache warm-up internally."
                 ),
             })
         return None
@@ -48,8 +48,56 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
     # Helpers
     # ------------------------------------------------------------------
 
+    _label_caches: dict[str, dict[str, list[str]]] = {}
+
+    def _build_label_cache(cache: EnergyGraphCache) -> dict[str, list[str]]:
+        """Build a reverse index from shortened labels to full node names."""
+        bid = cache.branch_id or ""
+        if bid in _label_caches:
+            return _label_caches[bid]
+        index: dict[str, list[str]] = {}
+        rows = cache.db.execute("SELECT name FROM nodes").fetchall()
+        for (name,) in rows:
+            label = _shorten_id(name)
+            index.setdefault(label, []).append(name)
+            ll = label.lower()
+            if ll != label:
+                index.setdefault(ll, []).append(name)
+        _label_caches[bid] = index
+        return index
+
+    class _AmbiguousLabel(Exception):
+        """Raised when a short label matches multiple nodes."""
+        def __init__(self, label: str, candidates: list[str]):
+            self.label = label
+            self.candidates = candidates
+            super().__init__(
+                f"Ambiguous label '{label}' matches {len(candidates)} nodes: "
+                f"{candidates}. Use the full node ID instead."
+            )
+
     def _resolve(cache: EnergyGraphCache, query: str) -> str | None:
-        return cache.resolve_node(query)
+        """Resolve a query to a node name.  Falls back to label matching.
+
+        Raises ``_AmbiguousLabel`` when the short-label index contains
+        multiple candidates for the query.
+        """
+        result = cache.resolve_node(query)
+        if result is not None:
+            return result
+        label_index = _build_label_cache(cache)
+        if query in label_index:
+            candidates = label_index[query]
+            if len(candidates) > 1:
+                raise _AmbiguousLabel(query, candidates)
+            return candidates[0]
+        ql = query.lower()
+        if ql in label_index:
+            candidates = label_index[ql]
+            if len(candidates) > 1:
+                raise _AmbiguousLabel(ql, candidates)
+            return candidates[0]
+        return None
 
     def _node_summary(cache: EnergyGraphCache, name: str) -> dict | None:
         """Lightweight node lookup (no semantic_context/metadata)."""
@@ -84,6 +132,16 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
             return gate
         cache = get_cache()
         nodes = cache.grep_nodes(node_query, "all", top_k)
+        if not nodes:
+            # Fall back to label resolution
+            try:
+                resolved = _resolve(cache, node_query)
+            except _AmbiguousLabel as exc:
+                return json.dumps({"error": str(exc)})
+            if resolved:
+                node_data = cache.query_node(resolved)
+                if node_data:
+                    nodes = [node_data]
         results = []
         for node in nodes:
             name = node["name"]
@@ -199,7 +257,10 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
 
         resolved = []
         for name in names:
-            r = cache.resolve_node(name)
+            try:
+                r = _resolve(cache, name)
+            except _AmbiguousLabel as exc:
+                return json.dumps({"error": str(exc)})
             if r is None:
                 return json.dumps({"error": f"Node not found: {name}"})
             resolved.append(r)
@@ -266,7 +327,10 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
         if gate:
             return gate
         cache = get_cache()
-        target_name = _resolve(cache, node_query)
+        try:
+            target_name = _resolve(cache, node_query)
+        except _AmbiguousLabel as exc:
+            return json.dumps({"error": str(exc)})
         if target_name is None:
             return json.dumps({"error": f"Node not found: {node_query}"})
 
@@ -326,7 +390,10 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
         if gate:
             return gate
         cache = get_cache()
-        target_name = _resolve(cache, node_query)
+        try:
+            target_name = _resolve(cache, node_query)
+        except _AmbiguousLabel as exc:
+            return json.dumps({"error": str(exc)})
         if target_name is None:
             return json.dumps({"error": f"Node not found: {node_query}"})
 
@@ -422,55 +489,99 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
         if gate:
             return gate
         cache = get_cache()
-        src_name = _resolve(cache, source_query)
-        tgt_name = _resolve(cache, target_query)
+        try:
+            src_name = _resolve(cache, source_query)
+            tgt_name = _resolve(cache, target_query)
+        except _AmbiguousLabel as exc:
+            return json.dumps({"error": str(exc)})
         if src_name is None:
             return json.dumps({"error": f"Source not found: {source_query}"})
         if tgt_name is None:
             return json.dumps({"error": f"Target not found: {target_query}"})
 
-        dist = {src_name: 0.0}
-        prev = {}
-        prev_edge = {}
-        hops_map = {src_name: 0}
-        heap = [(0.0, src_name)]
+        # State space keyed by (node, hops_used) to bound search with
+        # negative-weight edges.  The layered structure (hops only increase)
+        # guarantees no cycles in the state graph, so the search terminates
+        # even with accelerating edges.
+        _TIMEOUT = 30.0
+        _MAX_HEAP = 100_000
+        t0 = time.monotonic()
+
+        # heap entries: (cost, hops, node)
+        best: dict[tuple[str, int], float] = {(src_name, 0): 0.0}
+        prev: dict[tuple[str, int], tuple[str, int]] = {}
+        prev_edge_map: dict[tuple[str, int], tuple[str, float]] = {}
+        heap = [(0.0, 0, src_name)]
+        bounded = False
 
         while heap:
-            cost, cur = heapq.heappop(heap)
-            if cur == tgt_name:
+            if time.monotonic() - t0 > _TIMEOUT:
+                bounded = True
                 break
-            if hops_map.get(cur, 0) >= max_hops:
+            if len(heap) > _MAX_HEAP:
+                bounded = True
+                break
+
+            cost, hops, cur = heapq.heappop(heap)
+
+            state = (cur, hops)
+            if cost > best.get(state, float("inf")):
+                continue  # stale entry
+
+            # Don't expand the target — but keep searching for cheaper
+            # arrivals at different hop counts.
+            if cur == tgt_name:
                 continue
-            if cost > dist.get(cur, float("inf")):
+
+            if hops >= max_hops:
                 continue
+
             for e in cache.get_outbound_edges(cur):
                 dst = e["target"]
                 te = e["transition_energy"]
                 if te is None:
                     continue
                 new_cost = cost + te
-                if new_cost < dist.get(dst, float("inf")):
-                    dist[dst] = new_cost
-                    prev[dst] = cur
-                    prev_edge[dst] = (e["type"], te)
-                    hops_map[dst] = hops_map.get(cur, 0) + 1
-                    heapq.heappush(heap, (new_cost, dst))
+                new_hops = hops + 1
+                new_state = (dst, new_hops)
+                if new_cost < best.get(new_state, float("inf")):
+                    best[new_state] = new_cost
+                    prev[new_state] = state
+                    prev_edge_map[new_state] = (e["type"], te)
+                    heapq.heappush(heap, (new_cost, new_hops, dst))
 
-        if tgt_name not in prev and src_name != tgt_name:
-            return json.dumps({
+        # Find the cheapest state where we reached the target.
+        target_states = [
+            (best[s], s) for s in best if s[0] == tgt_name
+        ]
+
+        if not target_states:
+            result = {
                 "source": _shorten_id(src_name),
                 "target": _shorten_id(tgt_name),
                 "reachable": False,
                 "reason": f"No path within {max_hops} hops",
-            })
+            }
+            if bounded:
+                result["note"] = (
+                    "Search was bounded (30 s timeout or 100 k heap cap). "
+                    "A path may exist but was not found within budget."
+                )
+            return json.dumps(result)
 
-        path_nodes = []
-        cur = tgt_name
-        while cur != src_name:
-            path_nodes.append(cur)
-            cur = prev[cur]
+        _, best_state = min(target_states)
+
+        # Reconstruct path by walking the predecessor chain.
+        path_nodes: list[str] = []
+        path_edges: list[tuple[str, float]] = []
+        st = best_state
+        while st in prev:
+            path_nodes.append(st[0])
+            path_edges.append(prev_edge_map[st])
+            st = prev[st]
         path_nodes.append(src_name)
         path_nodes.reverse()
+        path_edges.reverse()
 
         first_node = _node_summary(cache, path_nodes[0])
         entry_e = first_node["entry_energy"] if first_node and first_node["entry_energy"] is not None else None
@@ -486,7 +597,7 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
         }]
 
         for j in range(1, len(path_nodes)):
-            et, te = prev_edge[path_nodes[j]]
+            et, te = path_edges[j - 1]
             if te < 0:
                 mom += (99.0 - mom) * 0.25 * min(abs(te), 4.0) / 4.0
             else:
@@ -505,15 +616,22 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
                 "momentum": round(mom, 1),
             })
 
-        return json.dumps({
+        result = {
             "source": _shorten_id(src_name),
             "target": _shorten_id(tgt_name),
             "reachable": True,
             "hops": len(path_nodes) - 1,
-            "total_energy": round(dist[tgt_name], 3),
+            "total_energy": round(best[best_state], 3),
             "final_momentum": round(mom, 1),
             "steps": steps,
-        })
+        }
+        if bounded:
+            result["note"] = (
+                "Search was bounded (30 s timeout or 100 k heap cap). "
+                "The path shown is the best found within budget "
+                "but may not be globally optimal."
+            )
+        return json.dumps(result)
 
     @mcp.tool()
     async def energy_compare_paths(path_a: str, path_b: str) -> str:
@@ -553,7 +671,10 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
         if gate:
             return gate
         cache = get_cache()
-        target_name = _resolve(cache, node_query)
+        try:
+            target_name = _resolve(cache, node_query)
+        except _AmbiguousLabel as exc:
+            return json.dumps({"error": str(exc)})
         if target_name is None:
             return json.dumps({"error": f"Node not found: {node_query}"})
 
@@ -709,7 +830,10 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
             "SELECT DISTINCT source FROM edges WHERE transition_energy IS NOT NULL AND transition_energy < 0"
         ).fetchall():
             accel_sources.add(r[0])
-        start_nodes = entry_points | accel_sources
+        # Sort for deterministic iteration — set order varies across Python
+        # processes (hash seed randomization). Since global_cap truncates the
+        # search, different iteration orders produce different top-N results.
+        start_nodes = sorted(entry_points | accel_sources)
 
         max_paths = 500
         max_depth = 8          # paths > 8 hops rarely add signal
@@ -730,11 +854,14 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
                 if len(all_paths) >= global_cap:
                     break
                 cur, p_nodes, p_mom, visited = stack.pop()
-                next_hops = [
-                    (e["target"], e["transition_energy"])
-                    for e in cache.get_outbound_edges(cur)
-                    if e["transition_energy"] is not None and e["transition_energy"] < 0 and e["target"] not in visited
-                ]
+                next_hops = sorted(
+                    [
+                        (e["target"], e["transition_energy"])
+                        for e in cache.get_outbound_edges(cur)
+                        if e["transition_energy"] is not None and e["transition_energy"] < 0 and e["target"] not in visited
+                    ],
+                    key=lambda x: (x[1], x[0]),  # energy then name for determinism
+                )
                 if not next_hops or len(p_nodes) >= max_depth:
                     if len(p_nodes) >= 2:
                         all_paths.append({"nodes": list(p_nodes), "momentum": list(p_mom)})
@@ -801,7 +928,7 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
             "SELECT DISTINCT source FROM edges WHERE transition_energy IS NOT NULL AND transition_energy < 0"
         ).fetchall():
             accel_sources.add(r[0])
-        start_nodes = entry_points | accel_sources
+        start_nodes = sorted(entry_points | accel_sources)
 
         participation = Counter()
         total_paths = 0
@@ -819,11 +946,14 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
                 if total_paths >= global_cap:
                     break
                 cur, p_nodes, visited = stack.pop()
-                next_hops = [
-                    (e["target"], e["transition_energy"])
-                    for e in cache.get_outbound_edges(cur)
-                    if e["transition_energy"] is not None and e["transition_energy"] < 0 and e["target"] not in visited
-                ]
+                next_hops = sorted(
+                    [
+                        (e["target"], e["transition_energy"])
+                        for e in cache.get_outbound_edges(cur)
+                        if e["transition_energy"] is not None and e["transition_energy"] < 0 and e["target"] not in visited
+                    ],
+                    key=lambda x: (x[1], x[0]),  # energy then name for determinism
+                )
                 if not next_hops or len(p_nodes) >= max_depth:
                     if len(p_nodes) >= 2:
                         total_paths += 1

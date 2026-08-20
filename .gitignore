@@ -8,3 +8,4 @@ wiki/
 experiments/
 scratch/
 .pytest_cache/
+.claude/worktrees/

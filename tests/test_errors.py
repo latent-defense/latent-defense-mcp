@@ -1,4 +1,4 @@
-"""handle_response status-attachment (LD-2255, review: claude[bot]).
+"""handle_response status-attachment (Error handling tests).
 
 These pin the PRODUCER side of the 404-detection fix: handle_response must stamp
 the originating HTTP status onto every McpApiError it raises, for BOTH raise

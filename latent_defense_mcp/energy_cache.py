@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,10 @@ _CACHE_DIR = Path(os.environ.get(
 
 def _db_path(branch_id: str) -> Path:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return _CACHE_DIR / f"{branch_id}.db"
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]", "", branch_id)
+    if not safe_id:
+        raise ValueError("Invalid branch_id")
+    return _CACHE_DIR / f"{safe_id}.db"
 
 
 class EnergyGraphCache:
@@ -200,7 +204,7 @@ class EnergyGraphCache:
         cache._write_db.execute("DELETE FROM edges")
         cache._write_db.commit()
 
-        # 1. Fetch graph from InfraDB (NDJSON stream) → SQLite
+        # 1. Fetch graph (NDJSON stream) → SQLite
         await cache._fetch_graph(branch_id, http_client)
 
         # 2-4. Fetch metadata + energies from JEPA endpoints → overlay onto SQLite

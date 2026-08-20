@@ -49,8 +49,8 @@ mcp = InstrumentedFastMCP(
     instructions=(
         "Infrastructure security platform. Use these tools to explore "
         "infrastructure graphs, trigger mapping scans, run attack path analysis, "
-        "triage attack paths, dispatch validation, create remediation tickets, "
-        "and build threat models to test attack hypotheses against real infrastructure."
+        "triage attack paths, dispatch validation, and investigate security "
+        "findings with energy-based structural analysis."
     ),
 )
 
@@ -159,7 +159,10 @@ async def _http() -> Any:
     """
     global _client, _using_token_manager
     if _client is not None:
-        return _client
+        if getattr(_client, "is_closed", False):
+            _client = None  # Recreate below
+        else:
+            return _client
 
     # Try static API key first
     _client = make_client()
@@ -612,17 +615,6 @@ async def get_graph(branch_id: str) -> str:
 
 
 @mcp.tool()
-async def list_branch_attack_paths(branch_id: str) -> str:
-    """List attack paths stored on a branch before triage review. Use list_attack_paths() for the triaged queue."""
-    return json.dumps(
-        await _get(
-            f"/api/infra/branches/{branch_id}/attack-paths",
-            _tool="list_branch_attack_paths",
-        )
-    )
-
-
-@mcp.tool()
 async def create_branch(repo_id: str, label: str, source_branch_id: str = "") -> str:
     """Create a new branch in a repository.
 
@@ -671,8 +663,8 @@ async def search_nodes(repo_id: str, query: str) -> str:
     terms that appear in node names (e.g., "postgres", "credential", "nginx")
     rather than natural language phrases.
 
-    For semantic search by description, use oracle_search_nodes instead —
-    it finds nodes by meaning, not just name matching.
+    For local cache substring search use `grep_nodes`, or
+    `energy_node_scores` for energy-aware search.
     """
     return json.dumps(
         await _get(
@@ -700,43 +692,6 @@ async def infra_stats() -> str:
 # ---------------------------------------------------------------------------
 # Scanning and webhook dispatch
 # ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-async def trigger_scan(
-    description: str,
-    credentials_profile: str = "default",
-    cloud_accounts: str = "[]",
-    repositories: str = "[]",
-    domains: str = "[]",
-) -> str:
-    """Trigger a manual infrastructure mapping scan.
-
-    Args:
-        description: What to scan and why.
-        credentials_profile: Credential profile to use (default: "default").
-        cloud_accounts: JSON array of {"provider", "account_id", "regions"} objects.
-        repositories: JSON array of repo URL strings.
-        domains: JSON array of domain strings.
-    """
-    scope = {}
-    if cloud_accounts != "[]":
-        scope["cloud_accounts"] = _parse_json_param(cloud_accounts, "cloud_accounts")
-    if repositories != "[]":
-        scope["repositories"] = _parse_json_param(repositories, "repositories")
-    if domains != "[]":
-        scope["domains"] = _parse_json_param(domains, "domains")
-    return json.dumps(
-        await _post(
-            "/api/triggers/manual",
-            {
-                "description": description,
-                "scope": scope,
-                "credentials_profile": credentials_profile,
-            },
-            _tool="trigger_scan",
-        )
-    )
 
 
 @mcp.tool()
@@ -823,7 +778,7 @@ async def create_mapping_run(
 ) -> str:
     """Create a mapping run with full control over scan scope and configuration.
 
-    Use this instead of trigger_scan when you need fine-grained scope control.
+    Create and execute a mapping run with full control over scan scope and configuration.
 
     Args:
         description: What to map and why.
@@ -1033,7 +988,7 @@ def _project_path_list(
     result: Any, *, summary: bool, limit: int, offset: int
 ) -> Any:
     """Shared post-processing for the `/api/triage/paths` list response used by
-    list_attack_paths and paths_through_node. When `summary` is on, projects
+    list_attack_paths (with optional node_id filter). When `summary` is on, projects
     each path to a compact entry (path_id/status/risk_score/nodes/...); either
     way stamps `has_more` for pagination."""
     if summary and isinstance(result, dict):
@@ -1091,11 +1046,18 @@ async def list_attack_paths(
     source_detection_id: str = "",
     rescored: bool = False,
     rescored_window_hours: int | None = None,
+    node_id: str = "",
+    branch_id: str = "",
 ) -> str:
-    """List attack paths, optionally filtered by status, risk score, repository, or MITRE technique.
+    """List attack paths, optionally filtered by status, risk score, repository, MITRE technique,
+    node, or branch.
 
     Use ``status=superseded`` to list paths eliminated by re-scoring (system-dismissed,
     not operator-dismissed). Superseded paths should not be acted on with dismiss_path.
+
+    Pass ``node_id`` to find attack paths that flow through a specific node (chokepoint
+    analysis, CVE assessment). Pass ``branch_id`` to list paths stored on a branch before
+    triage review.
 
     Args:
         status: Filter by status. Values: new, acknowledged, validating, validated, ticketed, closed, failed, false_positive, superseded.
@@ -1108,11 +1070,22 @@ async def list_attack_paths(
         mitre_technique: Filter to paths that include this MITRE technique ID (e.g. "T1078").
         source_detection_id: Filter to paths produced from a specific detection finding.
         rescored: When True, narrow to paths a recent re-grade acted on (the "recently
-            re-scored" queue, LD-2247/C1a). Default False preserves the current view.
+            re-scored" queue). Default False preserves the current view.
         rescored_window_hours: How far back "recently" reaches, in hours (only meaningful
-            with rescored=True). Must be > 0 and <= 8760 (1 year); the server rejects an
-            out-of-range value with a clean 422. Omit to use the server default (72h).
+            with rescored=True). Must be > 0 and <= 8760 (1 year). Omit to use the server default (72h).
+        node_id: Filter to paths that pass through this node (by node name). For
+            chokepoint reasoning and CVE assessment.
+        branch_id: When provided, lists paths stored on this branch (pre-triage)
+            via GET /api/infra/branches/{branch_id}/attack-paths.
     """
+    # Branch-scoped: use the infra endpoint directly
+    if branch_id:
+        result = await _get(
+            f"/api/infra/branches/{branch_id}/attack-paths",
+            _tool="list_attack_paths",
+        )
+        return json.dumps(result)
+
     params: dict[str, Any] = {"limit": limit, "offset": offset}
     if status:
         params["status"] = status
@@ -1126,62 +1099,13 @@ async def list_attack_paths(
         params["mitre_technique"] = mitre_technique
     if source_detection_id:
         params["source_detection_id"] = source_detection_id
-    # LD-2258 (E6): forward the WS-C C1a `rescored` filter to GET /api/triage/paths
-    # (triage#107). Names/types mirror the server signature verbatim
-    # (`rescored: bool`, `rescored_window_hours: int`, server default 72h, must be > 0) —
-    # an MCP param the server doesn't recognize is dropped silently, so they must match.
-    # Default-off: omit both when unset so there is no behavior change vs the current view.
     if rescored:
         params["rescored"] = rescored
     if rescored_window_hours is not None:
         params["rescored_window_hours"] = rescored_window_hours
+    if node_id:
+        params["node_id"] = node_id
     result = await _get("/api/triage/paths", _tool="list_attack_paths", **params)
-    return json.dumps(_project_path_list(result, summary=summary, limit=limit, offset=offset))
-
-
-@mcp.tool()
-async def paths_through_node(
-    node_id: str,
-    status: str = "",
-    min_risk_score: float = 0,
-    limit: int = 20,
-    offset: int = 0,
-    summary: bool = True,
-    order: str = "",
-    repository_id: str = "",
-    mitre_technique: str = "",
-) -> str:
-    """Find attack paths that pass through a specific infrastructure node.
-
-    Answers "which attack paths go through this node?" for chokepoint reasoning
-    (a node many high-risk paths traverse is a high-leverage remediation target)
-    and for assessing a CVE on a specific node. Resolved server-side via the
-    node_names index — a containment lookup, not a scan of every path.
-
-    Args:
-        node_id: The InfraDB node name to match (a step's source_node or
-            target_node), e.g. "rds-primary" or "iam:role-1". Required.
-        status: Filter by status. Values: new, acknowledged, validating, validated, ticketed, closed, failed, false_positive.
-        min_risk_score: Only return paths with risk_score >= this value.
-        limit: Maximum paths to return (1–500, default 20).
-        offset: Pagination offset.
-        summary: True (default) returns compact summaries; False returns full path objects with step details.
-        order: Sort order — risk_score_desc (default), risk_score_asc, created_at_desc, created_at_asc.
-        repository_id: Filter to a single repository.
-        mitre_technique: Filter to paths that include this MITRE technique ID (e.g. "T1078").
-    """
-    params: dict[str, Any] = {"node_id": node_id, "limit": limit, "offset": offset}
-    if status:
-        params["status"] = status
-    if min_risk_score > 0:
-        params["min_risk_score"] = min_risk_score
-    if order:
-        params["order"] = order
-    if repository_id:
-        params["repository_id"] = repository_id
-    if mitre_technique:
-        params["mitre_technique"] = mitre_technique
-    result = await _get("/api/triage/paths", _tool="paths_through_node", **params)
     return json.dumps(_project_path_list(result, summary=summary, limit=limit, offset=offset))
 
 
@@ -1446,9 +1370,9 @@ async def add_path_comment(
 ) -> str:
     """Add a comment to an attack path.
 
-    Writes directly to InfraDB records (``triage_path_comment``), matching
-    the portal's comment client. Comments are returned by ``list_path_comments``
-    and ``list_path_history``.
+    Persists a new comment on the attack path. Comments are returned by
+    ``list_path_history``
+    (use ``include="comments"`` for comments only).
 
     Agent attribution (``author_kind: "agent"``) is stamped automatically —
     MCP comments are always agent-authored.
@@ -1505,72 +1429,47 @@ async def add_path_comment(
 
 
 @mcp.tool()
-async def list_path_history(path_id: str) -> str:
-    """Return the unified timeline for an attack path (LD-2010).
+async def list_path_history(path_id: str, include: str = "all") -> str:
+    """Return the unified timeline for an attack path.
 
     Includes status changes, score changes, and comments in chronological order.
     Use this to audit what happened to a path and why.
 
+    Comments are merged from all available sources, deduplicated, and
+    returned oldest-first.
+
     Args:
         path_id: Attack path ID.
+        include: What to include — "all" (default) returns the full timeline;
+            "comments" returns only comments (filters out status/score changes).
     """
-    return json.dumps(
-        await _get(f"/api/triage/paths/{path_id}/history", _tool="list_path_history")
+    # --- 1. Fetch the history timeline (status changes, score changes, etc.) ---
+    history_result = await _get(
+        f"/api/triage/paths/{path_id}/history", _tool="list_path_history"
     )
+    # Normalise to a flat list of events.
+    if isinstance(history_result, list):
+        history_events = history_result
+    elif isinstance(history_result, dict):
+        history_events = history_result.get("events", history_result.get("items", []))
+        if not isinstance(history_events, list):
+            history_events = []
+    else:
+        history_events = []
 
-
-@mcp.tool()
-async def list_path_comments(path_id: str) -> str:
-    """List all comments on an attack path — the list the portal comments panel shows (LD-2255).
-
-    Comments now live in two stores (LD-2198): new comments are persisted in InfraDB
-    generic records (``record_type=triage_path_comment``, keyed by ``parent_key_id=path_id``),
-    reached through the Portal at ``/api/infra/records``; pre-move comments still sit on the
-    triage service. This tool reads BOTH and merges them into one list — a plain triage proxy
-    would miss every new (post-move) comment. Results are deduplicated by ``comment_id``
-    (InfraDB wins on collision) and returned oldest-first.
-
-    Each comment carries ``text``, ``author`` (SSO email), ``created_at`` (from the payload's
-    ``at``), and the thread anchors ``parent_comment_id`` / ``parent_event_id`` (None on root
-    comments) so replies can be reconstructed as the portal shows them. For the full timeline
-    including status/score changes, use ``list_path_history``.
-
-    Args:
-        path_id: Attack path ID.
-    """
-    # New comments — InfraDB records store, reached through the Portal at
-    # `/api/infra/records`. `LATENT_DEFENSE_URL` is the Portal base URL; the Portal only
-    # proxies InfraDB below `/api/infra/` (nginx rewrites `^/api/infra/(.*)` -> `/api/$1`
-    # before forwarding to InfraDB, so `/api/infra/records` reaches InfraDB's `/api/records`).
-    # Calling `/api/records` directly hits the Portal itself and 404s — every post-move
-    # comment would be missed. This matches the
-    # Portal's own comment client (`portal src/api/pathComments.ts`, PR #310), which reads
-    # `GET /api/infra/records?record_type=triage_path_comment&parent_key_id={path_id}`.
-    #
-    # `/api/records` caps `limit` at 500 (server `le=500`) and returns `total`, so a single
-    # request silently truncates any path with >500 comments. Page through with limit+offset
-    # until we've pulled all `total` records (LD-2255). Records come back newest-first
-    # (created_at DESC, record_id DESC), but final ordering is redone by the sort below, so
-    # page order here is immaterial. Offset paging is fragile under concurrent inserts at
-    # HEAD: the dedup-by-comment_id below collapses a record that appears on two pages, but a
-    # brand-new insert mid-scan can still shift a row past a page boundary and be skipped —
-    # inherent to offset paging (a keyset cursor is the real fix, not yet available).
-    # Acceptable for a read-only comments list. (The Portal caps at 500 and does not page;
-    # returning the full thread here is a deliberate superset for agents.)
+    # --- 2. Fetch comment records ---
     _RECORDS_PAGE = 500
     infradb_records: list[Any] = []
     offset = 0
     while True:
         records_resp = await _get(
             "/api/infra/records",
-            _tool="list_path_comments",
+            _tool="list_path_history",
             record_type="triage_path_comment",
             parent_key_id=path_id,
             limit=_RECORDS_PAGE,
             offset=offset,
         )
-        # Device-flow auth still pending → surface the browser-approval prompt verbatim
-        # (mirrors run_inference) instead of masquerading it as an empty comment list.
         if (
             isinstance(records_resp, dict)
             and records_resp.get("status") == "authentication_required"
@@ -1582,14 +1481,8 @@ async def list_path_comments(path_id: str) -> str:
         if not isinstance(page, list):
             break
         infradb_records.extend(page)
-        # An empty page means we've reached the end — stop unconditionally (also the
-        # backstop for a `total` that over-reports, so we never loop forever).
         if not page:
             break
-        # `total` is authoritative for the stopping condition. Guard against a missing/
-        # non-int total (older backend, malformed body) by falling back to "stop when a
-        # page comes back short". `type(total) is int` (not isinstance) so a JSON bool
-        # `total: true` can't masquerade as 1 and truncate at page one.
         total = records_resp.get("total")
         got = len(infradb_records)
         if type(total) is int:
@@ -1597,56 +1490,40 @@ async def list_path_comments(path_id: str) -> str:
                 break
         elif len(page) < _RECORDS_PAGE:
             break
-        # Advance by the actual page size, not the requested limit. If a misbehaving
-        # backend ignores `offset` or over-returns, this keeps offset monotonic with the
-        # data actually consumed instead of over-stepping and silently dropping the tail.
         offset += len(page)
 
-    # Legacy pre-move comments — best-effort ONLY for the expected 404 (the path is
-    # InfraDB-only, so triage has no comments record). Any other failure (auth, 403,
-    # 5xx) is unexpected and re-raised so a silently-partial list never hides a real
-    # problem. The InfraDB read above stays authoritative and is never suppressed.
+    # --- 3. Fetch legacy triage comments (pre-move, 404-safe) ---
     legacy_comments: list[Any] = []
     try:
         legacy = await _get(
-            f"/api/triage/paths/{path_id}/comments", _tool="list_path_comments"
+            f"/api/triage/paths/{path_id}/comments", _tool="list_path_history"
         )
         if isinstance(legacy, dict) and legacy.get("status") == "authentication_required":
             return json.dumps(legacy)
         if isinstance(legacy, list):
             legacy_comments = legacy
     except McpApiError as e:
-        # Only an expected 404 (path is InfraDB-only, so triage has no comments
-        # record) is swallowed; anything else (auth, 403, 5xx) re-raises. Match on
-        # the HTTP status, not the message prefix: handle_response prefers the
-        # structured error envelope for non-401/403 statuses, so a 404 that ships
-        # an {error:{code,message}} envelope carries the envelope's message, not
-        # "Resource not found (404)" — the old prefix check would then abort the
-        # whole tool on an InfraDB-only path (review: claude[bot], LD-2255).
         if e.status != 404:
             raise
-        log.warning("list_path_comments: no legacy triage comments for %s (404)", path_id)
+        log.warning("list_path_history: no legacy triage comments for %s (404)", path_id)
 
-    merged: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-
+    # --- 4. Merge & dedup comments from all three sources ---
     def _first_present(d: dict[str, Any], *keys: str) -> Any:
-        """First key that is PRESENT (not first truthy). A comment written at epoch 0
-        (`at=0`) or with an empty `at` is a real value — an `or` chain would skip it and
-        wrongly fall back to the record envelope's write time, reintroducing the
-        envelope-timestamp bug for falsy-but-valid timestamps."""
         for k in keys:
             if k in d and d[k] is not None:
                 return d[k]
         return None
 
-    def _add(comment: dict[str, Any], source: str) -> None:
+    merged_comments: dict[str, dict[str, Any]] = {}
+    comment_order: list[str] = []
+
+    def _add_comment(comment: dict[str, Any], source: str) -> None:
         cid = comment.get("comment_id")
-        # Dedup by comment_id; a comment with no id can't collide, so key it uniquely.
-        key = str(cid) if cid is not None else f"_anon_{source}_{len(order)}"
-        if key in merged:
+        key = str(cid) if cid is not None else f"_anon_{source}_{len(comment_order)}"
+        if key in merged_comments:
             return
-        merged[key] = {
+        merged_comments[key] = {
+            "event_type": "comment",
             "comment_id": cid,
             "path_id": comment.get("path_id", path_id),
             "actor": comment.get("actor"),
@@ -1655,19 +1532,14 @@ async def list_path_comments(path_id: str) -> str:
             "agent_name": comment.get("agent_name"),
             "text": comment.get("text"),
             "created_at": comment.get("created_at"),
+            "at": comment.get("at") or comment.get("created_at"),
             "parent_comment_id": comment.get("parent_comment_id"),
             "parent_event_id": comment.get("parent_event_id"),
             "source": source,
         }
-        order.append(key)
+        comment_order.append(key)
 
-    # InfraDB records carry the comment payload in `data` (Portal `PathComment` shape:
-    # comment_id, path_id, text, author, parent_comment_id?, parent_event_id?, at). The
-    # canonical timestamp is `data.at` — the Portal maps `created_at = c.at`
-    # (pathComments.ts commentAsHistoryItem). Read `at` FIRST (by presence, so `at=0`/""
-    # is honoured); only then fall back to a payload `created_at`, then the record
-    # envelope's `created_at`. Timestamping from the envelope alone (the earlier bug)
-    # mis-orders comments vs the portal timeline.
+    # Database records (authoritative — added first so they win dedup).
     for rec in infradb_records:
         if not isinstance(rec, dict):
             continue
@@ -1675,15 +1547,10 @@ async def list_path_comments(path_id: str) -> str:
         created_at = _first_present(data, "at", "created_at")
         if created_at is None:
             created_at = rec.get("created_at")
-        # Presence-based, like created_at above: a present-but-falsy comment_id
-        # (0 or "" from an unvalidated writer) is a real id — an `or` chain would
-        # skip it and fall through to the envelope key_id, then dedup by the wrong
-        # key (review: claude[bot], LD-2255). Fall back to key_id only when the
-        # payload has no comment_id at all.
         comment_id = _first_present(data, "comment_id")
         if comment_id is None:
             comment_id = rec.get("key_id")
-        _add(
+        _add_comment(
             {
                 "comment_id": comment_id,
                 "path_id": data.get("path_id") or rec.get("parent_key_id") or path_id,
@@ -1693,18 +1560,18 @@ async def list_path_comments(path_id: str) -> str:
                 "agent_name": data.get("agent_name"),
                 "text": data.get("text"),
                 "created_at": created_at,
+                "at": created_at,
                 "parent_comment_id": data.get("parent_comment_id"),
                 "parent_event_id": data.get("parent_event_id"),
             },
             "infradb",
         )
 
-    # Legacy triage PathComment: {comment_id, path_id, actor, author, text, created_at}
-    # — flat (no threads), timestamp in `created_at`. Normalize `at` -> created_at too in
-    # case a pre-move row already used the newer key.
+    # Legacy triage comments.
     for c in legacy_comments:
         if isinstance(c, dict):
-            _add(
+            ts = _first_present(c, "created_at", "at")
+            _add_comment(
                 {
                     "comment_id": c.get("comment_id"),
                     "path_id": c.get("path_id", path_id),
@@ -1713,34 +1580,81 @@ async def list_path_comments(path_id: str) -> str:
                     "author_kind": c.get("author_kind"),
                     "agent_name": c.get("agent_name"),
                     "text": c.get("text"),
-                    "created_at": _first_present(c, "created_at", "at"),
+                    "created_at": ts,
+                    "at": ts,
                     "parent_comment_id": c.get("parent_comment_id"),
                     "parent_event_id": c.get("parent_event_id"),
                 },
                 "triage",
             )
 
-    comments = [merged[k] for k in order]
-    # Oldest-first. created_at is normally an ISO-8601 string (lexicographic ==
-    # chronological), but InfraDB generic-records `data` is unvalidated, so coerce to
-    # str to avoid a str-vs-int TypeError if a client wrote a numeric timestamp.
-    # (A numeric `at` then sorts lexicographically, not chronologically — best-effort
-    # only for such non-canonical writes; real ISO-8601 comments order correctly.)
-    # Missing created_at (pre-LD-2010 blobs) sorts last, deterministically.
-    comments.sort(key=lambda c: (c.get("created_at") is None, str(c.get("created_at") or "")))
+    # History-endpoint comments (lowest priority — skipped if already merged from
+    # infrastructure database or legacy).
+    for ev in history_events:
+        if isinstance(ev, dict) and ev.get("event_type") == "comment":
+            ts = ev.get("at") or ev.get("created_at")
+            _add_comment(
+                {
+                    "comment_id": ev.get("comment_id"),
+                    "path_id": ev.get("path_id", path_id),
+                    "actor": ev.get("actor"),
+                    "author": ev.get("author"),
+                    "author_kind": ev.get("author_kind"),
+                    "agent_name": ev.get("agent_name"),
+                    "text": ev.get("text"),
+                    "created_at": ts,
+                    "at": ts,
+                    "parent_comment_id": ev.get("parent_comment_id"),
+                    "parent_event_id": ev.get("parent_event_id"),
+                },
+                "history",
+            )
 
-    return json.dumps(comments)
+    all_comments = list(merged_comments.values())
+    all_comments.sort(
+        key=lambda c: (c.get("at") is None, str(c.get("at") or ""))
+    )
+
+    # --- 5. Return based on include filter ---
+    if include == "comments":
+        return json.dumps(all_comments)
+
+    # include="all": merge comments into the full history timeline, deduplicating
+    # any comment events already in history_events.
+    seen_comment_ids = {c.get("comment_id") for c in all_comments if c.get("comment_id")}
+    non_comment_events = [
+        ev for ev in history_events
+        if not isinstance(ev, dict)
+        or ev.get("event_type") != "comment"
+    ]
+    # Also drop history comment events that were already merged (to avoid dupes).
+    for ev in history_events:
+        if (
+            isinstance(ev, dict)
+            and ev.get("event_type") == "comment"
+            and ev.get("comment_id") not in seen_comment_ids
+        ):
+            non_comment_events.append(ev)
+
+    combined = non_comment_events + all_comments
+    combined.sort(
+        key=lambda e: (
+            e.get("at", e.get("created_at")) is None,
+            str(e.get("at", e.get("created_at")) or ""),
+        )
+    )
+    return json.dumps(combined)
 
 
 @mcp.tool()
 async def edit_path_comment(path_id: str, comment_id: str, text: str) -> str:
     """Edit the text of an existing comment on an attack path.
 
-    Appends a new revision (LD-2185 D1, option b) — does not overwrite. The
-    previous revision stays in InfraDB untouched, preserving a full edit trail.
-    Matches the portal's ``editPathComment`` in ``pathComments.ts``.
+    Appends a new revision — does not overwrite. The
+    previous revision stays in the database untouched, preserving a full edit trail.
+    Appends a new revision — does not overwrite.
 
-    Authorship is enforced server-side (infradb#88): a write that supersedes
+    Authorship is enforced server-side: a write that supersedes
     another user's revision is rejected with HTTP 403.
 
     Args:
@@ -1854,12 +1768,19 @@ async def edit_path_comment(path_id: str, comment_id: str, text: str) -> str:
 
 
 @mcp.tool()
-async def triage_stats(repository_id: str = "") -> str:
-    """Get triage statistics (counts by status, severity, repository)."""
-    params = {}
+async def triage_stats(repository_id: str = "", view: str = "summary") -> str:
+    """Get triage statistics (counts by status, severity, repository).
+
+    Args:
+        repository_id: Filter to a single repository. Empty for all.
+        view: "summary" (default) returns overall triage stats; "classification"
+            returns the classification breakdown (attack path type distribution).
+    """
+    params: dict[str, Any] = {}
     if repository_id:
         params["repository_id"] = repository_id
-    return json.dumps(await _get("/api/triage/stats", _tool="triage_stats", **params))
+    endpoint = "/api/triage/stats/classification" if view == "classification" else "/api/triage/stats"
+    return json.dumps(await _get(endpoint, _tool="triage_stats", **params))
 
 
 @mcp.tool()
@@ -1867,26 +1788,11 @@ async def get_triage_config() -> str:
     """Get triage display configuration.
 
     Returns the rescore display threshold and any other published config.
-    Use this to apply the same re-score badge display logic the portal uses
+    Use this to apply the re-score badge display logic
     when deciding whether a risk score change is worth reporting.
     """
     return json.dumps(
         await _get("/api/triage/config", _tool="get_triage_config")
-    )
-
-
-@mcp.tool()
-async def get_classification_stats(repository_id: str = "") -> str:
-    """Get attack path classification statistics (breakdown by classification).
-
-    Args:
-        repository_id: Filter to a single repository. Empty for all.
-    """
-    params = {}
-    if repository_id:
-        params["repository_id"] = repository_id
-    return json.dumps(
-        await _get("/api/triage/stats/classification", _tool="get_classification_stats", **params)
     )
 
 
@@ -1974,293 +1880,6 @@ async def get_validation_status(run_id: str) -> str:
     """Get the status of a validation run (step counts, progress)."""
     return json.dumps(
         await _get(f"/validator-api/validate/{run_id}", _tool="get_validation_status")
-    )
-
-
-# ---------------------------------------------------------------------------
-# Ticketing — remediation tickets
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-async def list_tickets(status: str = "", limit: int = 20) -> str:
-    """List remediation tickets."""
-    params: dict[str, Any] = {"limit": limit}
-    if status:
-        params["status"] = status
-    return json.dumps(await _get("/api/tickets", _tool="list_tickets", **params))
-
-
-@mcp.tool()
-async def get_ticket(ticket_id: str) -> str:
-    """Get remediation ticket details."""
-    return json.dumps(await _get(f"/api/tickets/{ticket_id}", _tool="get_ticket"))
-
-
-@mcp.tool()
-async def ticket_stats() -> str:
-    """Get aggregate ticket statistics (counts by status, provider, and outcome)."""
-    result = await _get("/api/tickets/stats", _tool="ticket_stats")
-    if isinstance(result, dict) and result.get("total", 0) == 0:
-        result["hint"] = (
-            "No tickets yet. Use /remediate to create remediation tickets "
-            "from validated attack paths, or configure a ticketing provider first "
-            "with configure_ticket_provider()."
-        )
-    return json.dumps(result)
-
-
-@mcp.tool()
-async def create_remediation_ticket(
-    path_id: str,
-    repository_id: str,
-    branch_id: str,
-    entry_node: str,
-    target_node: str,
-    steps: str = "[]",
-    step_count: int = 0,
-    risk_score: float = 0.0,
-    mitre_techniques: str = "[]",
-    difficulty: str = "medium",
-    source: str = "",
-    validation_verdict: str = "",
-) -> str:
-    """Create a remediation ticket for an attack path and start two-step remediation.
-
-    Creates the upstream ticket on the active provider immediately (~seconds), then
-    runs the automated remediation analysis in the background and updates the ticket. Poll
-    get_ticket_steps for per-iteration progress. Provider-agnostic: the ticket lands on
-    whichever provider is currently active (see get_ticket_provider).
-
-    Args:
-        path_id: Attack path ID (from triage / validation tools).
-        repository_id: Repository ID the path belongs to.
-        branch_id: Branch ID.
-        entry_node: Path entry node ID.
-        target_node: Path target node ID.
-        steps: JSON array of path-step objects (source_node/target_node/...).
-        step_count: Number of steps in the path.
-        risk_score: Path risk score (0-100).
-        mitre_techniques: JSON array of MITRE ATT&CK technique IDs.
-        difficulty: Path difficulty label from the analysis model (e.g., "trivial", "easy", "medium", "hard", "extreme").
-        source: Optional origin tag for the ticket.
-        validation_verdict: Optional JSON object with the validation verdict.
-    """
-    body: dict[str, Any] = {
-        "path_id": path_id,
-        "repository_id": repository_id,
-        "branch_id": branch_id,
-        "entry_node": entry_node,
-        "target_node": target_node,
-        "step_count": step_count,
-        "risk_score": risk_score,
-        "difficulty": difficulty,
-    }
-    if steps != "[]":
-        body["steps"] = _parse_json_param(steps, "steps")
-    if mitre_techniques != "[]":
-        body["mitre_techniques"] = _parse_json_param(mitre_techniques, "mitre_techniques")
-    if source:
-        body["source"] = source
-    if validation_verdict:
-        body["validation_verdict"] = _parse_json_param(validation_verdict, "validation_verdict")
-    return json.dumps(
-        await _post("/api/tickets/remediate", body, _tool="create_remediation_ticket")
-    )
-
-
-@mcp.tool()
-async def get_ticket_steps(ticket_id: str) -> str:
-    """Get per-iteration remediation steps/progress for a ticket."""
-    return json.dumps(
-        await _get(f"/api/tickets/{ticket_id}/steps", _tool="get_ticket_steps")
-    )
-
-
-@mcp.tool()
-async def update_ticket_status(ticket_id: str, status: str) -> str:
-    """Update a ticket's status.
-
-    Args:
-        ticket_id: Ticket ID.
-        status: New status. One of: pending, analyzing, remediating, verifying,
-            creating_ticket, created, failed.
-    """
-    return json.dumps(
-        await _patch(
-            f"/api/tickets/{ticket_id}/status",
-            {"status": status},
-            _tool="update_ticket_status",
-        )
-    )
-
-
-@mcp.tool()
-async def sync_ticket(ticket_id: str) -> str:
-    """Force a one-off sync of a ticket's status from its upstream provider."""
-    return json.dumps(
-        await _post(f"/api/tickets/{ticket_id}/sync", _tool="sync_ticket")
-    )
-
-
-@mcp.tool()
-async def retry_ticket(ticket_id: str) -> str:
-    """Re-run remediation from a failed ticket."""
-    return json.dumps(
-        await _post(f"/api/tickets/{ticket_id}/retry", _tool="retry_ticket")
-    )
-
-
-# ---------------------------------------------------------------------------
-# Ticketing — provider configuration (provider-agnostic; admin via gateway)
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-async def get_ticket_provider() -> str:
-    """Get the active ticketing provider and all configured providers with verification state."""
-    result = await _get("/api/tickets/provider", _tool="get_ticket_provider")
-    if isinstance(result, dict):
-        providers = result.get("providers", {})
-        if isinstance(providers, dict):
-            for name, prov in providers.items():
-                if isinstance(prov, dict) and "config" in prov:
-                    config = prov["config"]
-                    if isinstance(config, dict):
-                        # Only keep config fields relevant to this provider
-                        prefix = name + "_"
-                        relevant = {k: v for k, v in config.items()
-                                    if k.startswith(prefix) or k in ("max_active_tickets",)
-                                    or not any(k.startswith(p + "_") for p in
-                                              ("jira", "linear", "github", "servicenow",
-                                               "pagerduty", "airtable", "asana"))}
-                        prov["config"] = relevant
-    return json.dumps(result)
-
-
-@mcp.tool()
-async def configure_ticket_provider(
-    provider: str,
-    config: str = "{}",
-    secret_keys: str = "",
-    set_active: bool = True,
-) -> str:
-    """Register or update a ticketing provider configuration.
-
-    One tool configures any supported provider (jira, linear, github, servicenow,
-    pagerduty, airtable, asana, custom) — the REST surface is provider-agnostic.
-    Secrets must be configured in the portal under Settings > Credentials; pass
-    secret_keys to reference which credential key holds each secret. Do not pass
-    raw secret values.
-
-    Args:
-        provider: Provider name (jira, linear, github, servicenow, pagerduty, airtable, asana, custom).
-        config: JSON object with provider-specific non-secret config (base_url, project, etc.).
-        secret_keys: Optional JSON object mapping credential roles to Secret keys.
-        set_active: Make this the active provider after configuring (default true).
-    """
-    body: dict[str, Any] = {"provider": provider, "set_active": set_active}
-    if config != "{}":
-        body["config"] = _parse_json_param(config, "config")
-    if secret_keys:
-        body["secret_keys"] = _parse_json_param(secret_keys, "secret_keys")
-    return json.dumps(
-        await _post(
-            "/api/tickets/provider/configure", body, _tool="configure_ticket_provider"
-        )
-    )
-
-
-@mcp.tool()
-async def test_ticket_provider(provider: str = "", config: str = "") -> str:
-    """Test a ticketing provider's auth without making it active.
-
-    Args:
-        provider: Provider name to test. Leave empty to test the currently-configured provider.
-        config: Optional JSON object with config overrides to test.
-    """
-    body: dict[str, Any] = {}
-    if provider:
-        body["provider"] = provider
-    if config:
-        body["config"] = _parse_json_param(config, "config")
-    return json.dumps(
-        await _post("/api/tickets/provider/test", body, _tool="test_ticket_provider")
-    )
-
-
-@mcp.tool()
-async def set_active_ticket_provider(provider: str) -> str:
-    """Switch the active ticketing provider to an already-configured provider."""
-    return json.dumps(
-        await _post(
-            "/api/tickets/provider/active",
-            {"provider": provider},
-            _tool="set_active_ticket_provider",
-        )
-    )
-
-
-@mcp.tool()
-async def remove_ticket_provider(provider: str) -> str:
-    """Remove a configured ticketing provider."""
-    return json.dumps(
-        await _delete(
-            f"/api/tickets/provider/{provider}", _tool="remove_ticket_provider"
-        )
-    )
-
-
-@mcp.tool()
-async def get_ticket_template_variables() -> str:
-    """List the variables a ticket template can reference (Jinja2 cheatsheet).
-
-    Returns every {{ variable }} available to a TicketTemplate — dotted path,
-    type, and description — plus the template `schema_version`. Fetch this before
-    authoring or previewing a template with preview_ticket_template.
-    """
-    return json.dumps(
-        await _get(
-            "/api/tickets/provider/template/variables",
-            _tool="get_ticket_template_variables",
-        )
-    )
-
-
-@mcp.tool()
-async def preview_ticket_template(
-    template: str,
-    stage: str = "final",
-    provider: str = "",
-) -> str:
-    """Dry-render a ticket template against synthetic content — no state touched.
-
-    Shows what a TicketTemplate will produce before it's saved on a provider.
-    Returns rendered_title / rendered_description, plus fell_back + warning when a
-    template fails to render (the hard-coded body is used instead), and a provider
-    transform_hint (e.g. Jira flattens markdown into ADF). Does NOT modify the
-    saved template on the active provider.
-
-    Args:
-        template: JSON object for the TicketTemplate. Common fields:
-            description_template, title_template (Jinja2 source strings); optional
-            per-stage overrides description_template_{initial,final,failure} and
-            title_template_{initial,final,failure}; field_defaults (dict of scalar
-            custom-field defaults). `enabled` is forced on for the preview render.
-        stage: Lifecycle slice to render — "initial" (creation), "final"
-            (resolution), or "failure". Defaults to "final".
-        provider: Optional provider name; when set, the response includes a
-            transform hint for how that provider will mutate the rendered body.
-    """
-    body: dict[str, Any] = {"template": _parse_json_param(template, "template"), "stage": stage}
-    if provider:
-        body["provider"] = provider
-    return json.dumps(
-        await _post(
-            "/api/tickets/provider/template/preview",
-            body,
-            _tool="preview_ticket_template",
-        )
     )
 
 
@@ -2466,7 +2085,7 @@ async def _ensure_oracle_session() -> str:
 
 
 def _start_keepalive():
-    """Start a background task that pings the oracle session every 10 min.
+    """Start a background task that pings the analysis session every 10 min.
 
     The server reaps sessions after 30 min of inactivity. During long
     investigations, the user may pause to read output — this keeps the
@@ -2528,8 +2147,7 @@ async def _oracle_call(
                     "elapsed_secs": elapsed,
                     "message": (
                         f"Graph is still loading ({elapsed}s elapsed). "
-                        "Call oracle_load_status to check progress. "
-                        "Do not call other oracle tools until loading completes."
+                        "Call load_graph_energies to reload."
                     ),
                 }
             )
@@ -2553,19 +2171,19 @@ async def _oracle_call(
         _graph_loaded = False
         _stop_keepalive()
         log.warning(
-            "Oracle session expired (30-minute idle timeout). "
+            "Analysis session expired (30-minute idle timeout). "
             "Creating a new session. You will need to reload your "
-            "graph with oracle_load_branch().",
+            "graph with load_graph_energies().",
         )
         await _ensure_oracle_session()
         return json.dumps(
             {
-                "error": "oracle_session_expired",
+                "error": "session_expired",
                 "message": (
                     "Your analysis session expired after 30 minutes of inactivity. "
                     "A new session has been created, but you need to reload your "
-                    "graph by calling oracle_load_branch() before running other "
-                    "oracle tools."
+                    "graph by calling load_graph_energies() before running other "
+                    "analysis tools."
                 ),
             }
         )
@@ -2682,7 +2300,7 @@ async def _require_loaded_graph() -> str | None:
         return json.dumps(
             {
                 "status": "no_graph_loaded",
-                "message": "No graph is loaded. Call oracle_load_branch first.",
+                "message": "No graph is loaded. Call load_graph_energies first.",
             }
         )
     if _graph_loaded:
@@ -2701,8 +2319,7 @@ async def _require_loaded_graph() -> str | None:
                 "elapsed_secs": elapsed,
                 "message": (
                     f"Graph is still loading ({elapsed}s elapsed). "
-                    "Call oracle_load_status for detailed progress. "
-                    "Do not call other oracle tools until loading completes."
+                    "Wait for load_graph_energies to complete."
                 ),
             }
         )
@@ -2710,21 +2327,27 @@ async def _require_loaded_graph() -> str | None:
         {
             "status": "loading",
             "message": (
-                "Graph is still loading. Call oracle_load_status for detailed progress. "
-                "Do not call other oracle tools until loading completes."
+                "The graph is still loading. Wait for load_graph_energies to complete."
             ),
         }
     )
 
 
 @mcp.tool()
-async def oracle_load_branch(branch_id: str) -> str:
-    """Load an infrastructure graph branch into the analysis session.
+async def load_branch(branch_id: str) -> str:
+    """Load an infrastructure graph branch and start encoding.
 
-    Must be called before any graph exploration or threat-model matching.
-    Use list_branches(repo_id) to find valid branch IDs (format: 'branch_<hex>').
-    For large graphs (1000+ nodes), loading and analyzing takes 2-10 minutes. This tool returns
-    immediately. Use oracle_load_status() to poll until the graph is ready.
+    Triggers the encoder to process the graph. For large graphs (1000+
+    nodes), encoding takes 2-10 minutes. Call wait_for_load() to block until
+    encoding completes, then load_graph_energies() to fetch the energy scores
+    into the local cache.
+
+    Quick path: load_graph_energies(branch_id) handles load_branch +
+    wait_for_load + energy fetch in one call. Use the separate tools when
+    you need progress visibility during encoding (e.g., in workflows).
+
+    Args:
+        branch_id: The branch to load.
     """
     import time
 
@@ -2777,8 +2400,7 @@ async def oracle_load_branch(branch_id: str) -> str:
                 "Graph loading started. Latent Defense is analyzing your infrastructure. "
                 "This takes 2-5 minutes for large graphs "
                 "(up to 10 minutes for 10,000+ nodes). "
-                "Call oracle_wait_for_load() to block until ready, "
-                "or oracle_load_status() to check progress manually."
+                "load_graph_energies handles waiting automatically."
             ),
         }
     )
@@ -2788,12 +2410,12 @@ async def _format_encoding_progress() -> str:
     """Poll the inference server for encoding progress and return a formatted JSON response."""
     progress = await _fetch_encoding_progress()
     if progress and progress.get("stage") is not None:
-        # Mirrors EncodingStage in inference/crates/oracle/src/state.rs — update when stages change.
+        # Encoding pipeline stages — update when the inference server changes.
         stage_names = {
             0: "queued", 1: "fetching graph from infrastructure database",
             2: "checking cache", 3: "computing structural features",
-            4: "computing node embeddings", 5: "computing edge embeddings",
-            6: "running GNN encoder", 7: "building adjacency index",
+            4: "computing embeddings", 5: "computing relationships",
+            6: "encoding graph structure", 7: "building adjacency index",
             8: "complete", 9: "failed",
         }
         stage = progress.get("stage", 0)
@@ -2830,85 +2452,20 @@ async def _format_encoding_progress() -> str:
 
 
 @mcp.tool()
-async def oracle_load_status() -> str:
-    """Check whether the graph has finished loading after oracle_load_branch. Use oracle_wait_for_load() instead for automatic waiting."""
-    import time
+async def wait_for_load(timeout_secs: int = 600, poll_interval: int = 30) -> str:
+    """Wait for graph encoding to complete after load_branch().
 
-    global _graph_loaded, _encoding_started_at
+    Blocks until the encoder finishes processing the graph, reporting
+    progress at each poll interval. Returns when the graph is ready for
+    energy analysis.
 
-    if _load_branch_id is None:
-        return json.dumps(
-            {
-                "status": "no_load_in_progress",
-                "message": "No load_branch call has been made. Call oracle_load_branch first.",
-            }
-        )
+    Quick path: load_graph_energies(branch_id) handles load_branch +
+    wait_for_load + energy fetch in one call. Use the separate tools when
+    you need progress visibility during encoding (e.g., in workflows).
 
-    if _graph_loaded:
-        probe = await _probe_oracle_graph_loaded(expected_branch=_load_branch_id)
-        if probe is not None:
-            return json.dumps({"status": "loaded", "result": probe})
-        # Graph was loaded but session may have been reaped — fall through to reap handling
-
-    probe = await _probe_oracle_graph_loaded(expected_branch=_load_branch_id)
-    if probe is not None:
-        _graph_loaded = True
-        _encoding_started_at = None
-        _start_keepalive()
-        return json.dumps({"status": "loaded", "result": probe})
-
-    # Probe returned None — either still encoding, or session was reaped
-    if _oracle_session is None:
-        # Session was reaped by the 404 handler in _oracle_call or probe.
-        # Auto-retry: create a new session and re-dispatch load_branch.
-        branch = _load_branch_id
-        _graph_loaded = False
-        _stop_keepalive()
-        _encoding_started_at = time.time()
-        sid = await _ensure_oracle_session()
-        try:
-            client = await _http()
-            await client.post(
-                f"/api/oracle/sessions/{sid}/call",
-                json={"method": "load_branch", "params": {"branch_id": branch}},
-                timeout=30,
-            )
-        except Exception:
-            pass
-        return json.dumps(
-            {
-                "status": "reloading",
-                "message": (
-                    "Previous session expired (30-minute idle timeout). "
-                    "Automatically created a new session and re-dispatched graph loading. "
-                    "Check again in 30-60 seconds."
-                ),
-            }
-        )
-
-    # Session exists but graph not loaded yet — encoding in progress.
-    # Check if encoding just completed (stage 8) so we can unblock the gate.
-    progress = await _fetch_encoding_progress()
-    if progress and progress.get("stage") == 8:
-        probe = await _probe_oracle_graph_loaded(expected_branch=_load_branch_id)
-        if probe is not None:
-            _graph_loaded = True
-            _encoding_started_at = None
-            _start_keepalive()
-            log.info("encoding complete — oracle gate unlocked for branch %s", _load_branch_id)
-            return json.dumps({"status": "loaded", "message": "Graph encoding complete and loaded.", "result": probe})
-    return await _format_encoding_progress()
-
-
-@mcp.tool()
-async def oracle_wait_for_load(timeout_secs: int = 600, poll_interval: int = 30) -> str:
-    """Wait for graph loading to complete after oracle_load_branch.
-
-    Blocks until the graph is loaded or the timeout expires. Use this instead of
-    manually polling oracle_load_status in a loop.
-
-    Returns the graph info (node/edge counts, types) on success, or an error
-    if the timeout is reached or the session expires.
+    Args:
+        timeout_secs: Maximum wait time in seconds (default 600).
+        poll_interval: Seconds between progress checks (default 30).
     """
     import asyncio
     import time
@@ -2919,7 +2476,7 @@ async def oracle_wait_for_load(timeout_secs: int = 600, poll_interval: int = 30)
         return json.dumps(
             {
                 "status": "no_load_in_progress",
-                "message": "No load_branch call has been made. Call oracle_load_branch first.",
+                "message": "No load_branch call has been made. Call load_graph_energies first.",
             }
         )
 
@@ -2967,205 +2524,14 @@ async def oracle_wait_for_load(timeout_secs: int = 600, poll_interval: int = 30)
             "message": (
                 f"Graph loading did not complete within {timeout_secs}s "
                 f"({elapsed}s elapsed). Loading may still be running "
-                "server-side. Try calling oracle_load_status() or "
-                "oracle_wait_for_load() again."
+                "server-side. Try calling load_graph_energies to retry."
             ),
         }
     )
 
 
 @mcp.tool()
-async def oracle_graph_info() -> str:
-    """Get node/edge counts, type distribution, and available edge types for the loaded graph."""
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    raw = await _oracle_call("graph_info", _tool="oracle_graph_info")
-    try:
-        result = json.loads(raw)
-        if isinstance(result, dict):
-            # Filter unknown/internal edge types
-            for key in ("edge_types", "available_edge_types", "edge_type_distribution"):
-                val = result.get(key)
-                if isinstance(val, list):
-                    result[key] = [t for t in val if t != "<UNK>"]
-                elif isinstance(val, dict):
-                    result[key] = {k: v for k, v in val.items() if k != "<UNK>"}
-        return json.dumps(result)
-    except (json.JSONDecodeError, TypeError):
-        return raw
-
-
-@mcp.tool()
-async def oracle_list_nodes(node_type: str = "all", limit: int = 20) -> str:
-    """Browse nodes in the loaded graph, optionally filtered by type."""
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    return await _oracle_call(
-        "list_nodes",
-        {"node_type": node_type, "limit": limit},
-        _tool="oracle_list_nodes",
-    )
-
-
-@mcp.tool()
-async def oracle_get_node(query: str) -> str:
-    """Look up an infrastructure component by description (e.g., 'production database' or 'API gateway'). Returns the closest match with its type, properties, and connections."""
-    if not query or not query.strip():
-        return json.dumps(
-            {"error": "invalid_query", "message": "query cannot be empty."}
-        )
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    return await _oracle_call("get_node", {"query": query}, _tool="oracle_get_node")
-
-
-@mcp.tool()
-async def oracle_search_nodes(
-    node_description: str, node_type: str = "all", top_k: int = 10
-) -> str:
-    """Search for infrastructure components by description. Returns the closest matches ranked by relevance."""
-    if not node_description or not node_description.strip():
-        return json.dumps(
-            {"error": "invalid_query", "message": "node_description cannot be empty."}
-        )
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    return await _oracle_call(
-        "search_nodes",
-        {
-            "node_description": node_description,
-            "node_type": node_type,
-            "top_k": top_k,
-        },
-        _tool="oracle_search_nodes",
-    )
-
-
-@mcp.tool()
-async def oracle_tm_add_node(name: str, description: str, node_type: str) -> str:
-    """Add a node to the threat model.
-
-    node_type must be a valid infrastructure type (e.g. 'service', 'credential',
-    'iam_role', 'http_endpoint', 's3_bucket', 'container', 'function').
-    Use oracle_graph_info() to see the full list of types in the loaded graph.
-    Description should be specific enough to match against real infrastructure components.
-    """
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    if not name or not name.strip():
-        return json.dumps(
-            {"error": "invalid_name", "message": "Node name cannot be empty."}
-        )
-    if not description or not description.strip():
-        return json.dumps(
-            {
-                "error": "invalid_description",
-                "message": "Node description cannot be empty.",
-            }
-        )
-    if node_type not in VALID_NODE_TYPES:
-        return json.dumps(
-            {
-                "error": "invalid_node_type",
-                "message": f"Invalid node_type '{node_type}'. Must be one of: {', '.join(sorted(VALID_NODE_TYPES))}",
-            }
-        )
-    return await _oracle_call(
-        "tm_add_node",
-        {
-            "name": name,
-            "description": description,
-            "node_type": node_type,
-        },
-        _tool="oracle_tm_add_node",
-    )
-
-
-@mcp.tool()
-async def oracle_tm_add_edge(
-    source: str, target: str, edge_type: str, description: str
-) -> str:
-    """Add a connection to your threat model. Describes how an attacker would move between two components."""
-    if not source or not source.strip():
-        return json.dumps(
-            {"error": "invalid_source", "message": "Edge source cannot be empty."}
-        )
-    if not target or not target.strip():
-        return json.dumps(
-            {"error": "invalid_target", "message": "Edge target cannot be empty."}
-        )
-    if not description or not description.strip():
-        return json.dumps(
-            {
-                "error": "invalid_description",
-                "message": "Edge description cannot be empty.",
-            }
-        )
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    return await _oracle_call(
-        "tm_add_edge",
-        {
-            "source": source,
-            "target": target,
-            "edge_type": edge_type,
-            "description": description,
-        },
-        _tool="oracle_tm_add_edge",
-    )
-
-
-@mcp.tool()
-async def oracle_tm_show() -> str:
-    """View the current threat model (nodes and edges)."""
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    return await _oracle_call("tm_show", _tool="oracle_tm_show")
-
-
-@mcp.tool()
-async def oracle_tm_clear() -> str:
-    """Clear the current threat model. This removes all nodes and edges and cannot be undone."""
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    return await _oracle_call("tm_clear", _tool="oracle_tm_clear")
-
-
-@mcp.tool()
-async def oracle_tm_match(top_k: int = 5) -> str:
-    """Compare your threat model against real infrastructure to find matching attack paths. Returns a diagram showing which components exist in your environment, the paths between them, and how difficult each step would be for an attacker."""
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    return await _oracle_call("tm_match", {"top_k": top_k}, _tool="oracle_tm_match")
-
-
-@mcp.tool()
-async def oracle_tm_match_refine(top_k: int = 5, max_iterations: int = 3) -> str:
-    """Refine the threat model match by testing multiple attack entry points and scoring each path. Returns a detailed per-step breakdown showing which paths are most feasible and where security controls were detected. Run this before submitting paths."""
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    return await _oracle_call(
-        "tm_match_refine",
-        {
-            "top_k": top_k,
-            "max_iterations": max_iterations,
-        },
-        _tool="oracle_tm_match_refine",
-    )
-
-
-@mcp.tool()
-async def oracle_submit_attack_path(
+async def submit_attack_path(
     nodes: str, description: str = "", report: str = ""
 ) -> str:
     """Submit a discovered attack path as a chain of node descriptions (separated by ' -> '). The path is scored for feasibility and forwarded to triage. Include a report with your full analysis — it travels downstream to triage and the validator.
@@ -3173,8 +2539,17 @@ async def oracle_submit_attack_path(
     Args:
         nodes: Node descriptions separated by ' -> '. Example: "public API gateway -> auth service -> database credentials -> production DB"
         description: Optional description of the attack path.
-        report: Full attack path analysis report (markdown). Should include: executive summary, per-hop energy analysis, threat model context, evidence citations, MITRE ATT&CK annotations, and risk assessment. This report travels downstream to triage and the validator — all reasoning must be captured here.
+        report: Full attack path analysis report (markdown). Should include: executive summary, per-hop energy analysis, attack chain context, evidence citations, MITRE ATT&CK annotations, and risk assessment. This report travels downstream to triage and the validator — all reasoning must be captured here.
     """
+    # If the energy cache is loaded (e.g. from disk) but the inference
+    # session was never established, warm it up so _require_loaded_graph
+    # and _oracle_call work.
+    if not _graph_loaded and _energy_cache is not None and _energy_cache.loaded:
+        branch_id = _energy_cache.branch_id
+        if branch_id:
+            await load_branch(branch_id)
+            await wait_for_load(timeout_secs=300)
+
     guard = await _require_loaded_graph()
     if guard:
         return guard
@@ -3187,109 +2562,13 @@ async def oracle_submit_attack_path(
     return await _oracle_call(
         "submit_attack_path",
         params,
-        _tool="oracle_submit_attack_path",
+        _tool="submit_attack_path",
     )
-
-
-@mcp.tool()
-async def oracle_submit_matched_path(
-    description: str = "", report: str = ""
-) -> str:
-    """Submit attack paths from the current threat model's matched nodes. Requires tm_match or tm_match_refine to have been run first. Include a report with your full analysis — it travels downstream to triage and the validator.
-
-    Args:
-        description: Optional description of the attack path.
-        report: Full attack path analysis report (markdown). Should include: executive summary, per-hop energy analysis, threat model context, evidence citations, MITRE ATT&CK annotations, and risk assessment. This report travels downstream to triage and the validator — all reasoning must be captured here.
-    """
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    params: dict[str, str] = {"description": description}
-    if report:
-        params["report"] = report
-    return await _oracle_call(
-        "submit_matched_path",
-        params,
-        _tool="oracle_submit_matched_path",
-    )
-
-
-@mcp.tool()
-async def oracle_tm_list_templates(category: str = "") -> str:
-    """List available threat model templates. Categories: identity, network, data, supply_chain, cloud_services."""
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    params = {}
-    if category:
-        params["category"] = category
-    return await _oracle_call(
-        "tm_list_templates", params, _tool="oracle_tm_list_templates"
-    )
-
-
-@mcp.tool()
-async def oracle_tm_load_template(name: str) -> str:
-    """Load a saved threat model template by name. WARNING: replaces the current threat model entirely.
-
-    Call oracle_tm_show() first if you want to preserve the current model.
-    Use oracle_tm_list_templates() to see available templates.
-    """
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    return await _oracle_call(
-        "tm_load_template", {"name": name}, _tool="oracle_tm_load_template"
-    )
-
-
-@mcp.tool()
-async def oracle_tm_save(
-    name: str, description: str, category: str, source_template: str = ""
-) -> str:
-    """Save the current threat model as a reusable template.
-
-    Args:
-        name: Template name (kebab-case, e.g. 'refined-iam-escalation-aws-prod').
-        description: What this attack pattern does.
-        category: One of: identity, network, data, supply_chain, cloud_services.
-        source_template: Name of the seed template this was refined from, if any.
-    """
-    guard = await _require_loaded_graph()
-    if guard:
-        return guard
-    params: dict[str, Any] = {
-        "name": name,
-        "description": description,
-        "category": category,
-    }
-    if source_template:
-        params["source_template"] = source_template
-    return await _oracle_call("tm_save", params, _tool="oracle_tm_save")
-
-
-@mcp.tool()
-async def oracle_reset_session() -> str:
-    """Destroy the current oracle session and start fresh on the next tool call."""
-    global _oracle_session, _load_branch_id, _encoding_started_at, _graph_loaded
-    _load_branch_id = None
-    _encoding_started_at = None
-    _graph_loaded = False
-    if _oracle_session:
-        try:
-            await _delete(
-                f"/api/oracle/sessions/{_oracle_session}", _tool="oracle_reset_session"
-            )
-        except Exception:
-            pass
-        _oracle_session = None
-    return json.dumps({"status": "session reset"})
 
 
 # ---------------------------------------------------------------------------
-# Prompts (LD-2053) — agentic triage workflows that replace the portal Research
-# tab. Each is a one-shot @mcp.prompt() that expands into a structured set of
-# instructions the calling agent follows using the tools already on this server.
+# Prompts — agentic triage workflows that expand into structured instructions
+# the calling agent follows using the tools on this server.
 # ---------------------------------------------------------------------------
 
 
@@ -3386,46 +2665,77 @@ Start now with step 1, then summarise the queue before we walk the individual pa
     title="Assess CVE exposure",
     description=(
         "Investigate a CVE's exposure across the infrastructure graph. "
-        "Uses search_nodes + oracle_search_nodes + paths_through_node."
+        "Uses energy tools (grep_nodes, energy_node_scores, energy_trace_to_target) "
+        "and list_attack_paths with node_id filter."
     ),
 )
 def assess_cve(
     cve_id: str,
     repository_id: str = "",
+    branch_id: str = "",
 ) -> str:
     """Assess the exposure of a specific CVE across the infrastructure.
 
     Args:
         cve_id: CVE identifier (e.g. "CVE-2024-1234").
         repository_id: Restrict the assessment to a single repository (default: all).
+        branch_id: Branch to load for energy analysis (required for energy tools).
     """
     repo_filter = ""
     if repository_id:
         repo_filter = f", repository_id={json.dumps(repository_id)}"
 
+    load_step = ""
+    if branch_id:
+        load_step = f"""
+0. Load the graph with energy scores. Call:
+       load_graph_energies(branch_id={json.dumps(branch_id)})
+   This loads the graph and energy data into the local cache. All grep_*
+   and energy_* tools require this.
+"""
+
     return f"""\
 You are assessing the exposure of {json.dumps(cve_id)} across the infrastructure.
 
-1. Find affected nodes. Call BOTH:
-       search_nodes(repo_id={json.dumps(repository_id) if repository_id else '""'}, query={json.dumps(cve_id)})
-       oracle_search_nodes(query={json.dumps(cve_id)})
-   Deduplicate by node name. If zero results, the CVE may not be present in the
-   current graph — report that clearly and stop.
+**Energy context**: Energy scores represent structural resistance. Negative energy =
+low resistance (attacker moves easily). Positive energy = friction (security barrier).
+Risk score bands: 0-20 well defended, 20-40 moderate, 40-60 needs attention,
+60-80 high priority, 80-100 critical.
+{load_step}
+1. Find affected nodes. Call:
+       grep_nodes(pattern={json.dumps(cve_id)})
+   Also try component-level searches (e.g., the library or service named in the CVE).
+   If zero results, the CVE may not be present in the current graph — report that
+   clearly and stop.
 
-2. For each affected node, find attack paths through it:
-       paths_through_node(node_id=<node_name>{repo_filter})
+2. Understand structural position of affected nodes. Call:
+       energy_node_scores(node_ids=<comma-separated affected node IDs>)
+   This shows how much structural resistance surrounds each affected node.
+
+3. For each affected node, find attack paths through it:
+       list_attack_paths(node_id=<node_name>{repo_filter})
    Collect all paths. Note the risk scores and validation statuses.
 
-3. Present an exposure summary:
-   - **Affected nodes**: list each node with its type and location
+4. Trace paths from affected nodes to sensitive targets. Call:
+       energy_trace_to_target(source_id=<affected_node>, target_types="data_store,credential,secrets_manager")
+   This shows whether an attacker can reach high-value targets from the vulnerable node.
+
+5. Present an exposure summary:
+   - **Affected nodes**: list each node with its type, location, and energy score
    - **Attack paths**: for each path through an affected node, show:
      * risk_score
      * entry_node -> target_node
      * MITRE techniques
      * validation status
+   - **Structural assessment**: which nodes have low resistance (negative energy)
+     and which have compensating controls (positive energy/braking)
    - **Risk assessment**: highest risk score, number of paths, whether any
      are validated/exploitable
    - **Recommendation**: whether to validate, dismiss, or escalate
+
+Energy scores tell you WHERE to look. They are NOT conclusions. Always verify
+version numbers, feature usage, and runtime configuration before declaring
+exploitability.
 
 If there are many paths (>20), summarise by risk band and highlight the top 5.
 """
@@ -3435,16 +2745,18 @@ If there are many paths (>20), summarise by risk band and highlight the top 5.
     title="Chokepoint report",
     description=(
         "Identify infrastructure chokepoints where many attack paths converge. "
-        "Uses list_attack_paths + paths_through_node."
+        "Uses energy_chokepoints + energy_defenses for structural analysis."
     ),
 )
 def chokepoint_report(
+    branch_id: str = "",
     repository_id: str = "",
     min_paths: int = 3,
 ) -> str:
     """Identify chokepoints — nodes through which many attack paths flow.
 
     Args:
+        branch_id: Branch to load for energy analysis (required for energy tools).
         repository_id: Restrict the report to a single repository (default: all).
         min_paths: Minimum number of paths a node must appear in to qualify as
             a chokepoint (default: 3).
@@ -3453,33 +2765,475 @@ def chokepoint_report(
     if repository_id:
         repo_filter = f", repository_id={json.dumps(repository_id)}"
 
+    load_step = ""
+    if branch_id:
+        load_step = f"""
+1. Load the graph with energy scores. Call:
+       load_graph_energies(branch_id={json.dumps(branch_id)})
+"""
+
     return f"""\
 You are generating a chokepoint report for the infrastructure.
 
-1. Load the top attack paths. Call:
-       list_attack_paths(limit=200, order="risk_score_desc", summary=False{repo_filter})
-   If `has_more` is true, page through with `offset` until you have all paths (or
-   up to 500).
+**Energy context**: Energy scores represent structural resistance. Negative energy =
+low resistance (attacker moves easily). Positive energy = friction (security barrier).
+Risk score bands: 0-20 well defended, 20-40 moderate, 40-60 needs attention,
+60-80 high priority, 80-100 critical.
+{load_step}
+2. Find chokepoints using the energy model. Call:
+       energy_chokepoints(limit={min_paths})
+   This identifies nodes where many attack paths converge based on the
+   energy analysis — much faster and more accurate than manual node-frequency
+   counting. Filter to nodes appearing in at least {min_paths} paths.
 
-2. Extract node frequency. For each path, collect all nodes from its steps
-   (source_node and target_node). Count how many distinct paths each node appears in.
+3. Map defense nodes. Call:
+       energy_defenses()
+   This identifies nodes that provide braking energy (security boundaries,
+   auth checks, network segmentation) — the infrastructure's defensive controls.
 
-3. Filter to chokepoints: nodes appearing in >= {min_paths} paths.
-
-4. For each chokepoint node (sorted by path count descending), call:
-       paths_through_node(node_id=<node_name>{repo_filter})
-   to get the full path details.
+4. For each chokepoint (sorted by path count descending), get attack path details:
+       list_attack_paths(node_id=<node_name>{repo_filter})
 
 5. Present the chokepoint report. For each chokepoint:
    - **Node**: name and type
    - **Path count**: how many attack paths flow through it
+   - **Energy profile**: whether the node accelerates or brakes attackers
+   - **Nearby defenses**: defense nodes from energy_defenses that protect this chokepoint
    - **Highest risk score**: among the paths through this node
-   - **Validation status**: how many paths are validated vs unvalidated
    - **MITRE techniques**: distinct techniques across paths through this node
 
 6. End with a prioritised remediation recommendation:
    - Which chokepoint, if hardened, would eliminate the most high-risk paths?
+   - Map each chokepoint to its nearest defense nodes — which defenses already
+     provide some protection, and where are the gaps?
    - Estimate the risk reduction (number of paths × average risk score).
+"""
+
+
+@mcp.prompt(
+    title="Investigate a finding",
+    description=(
+        "Five-move investigation method: ground, position, trace, score, verify. "
+        "Uses energy tools for structural analysis of a scanner finding."
+    ),
+)
+def investigate_finding(
+    finding_description: str,
+    branch_id: str,
+) -> str:
+    """Investigate a scanner finding using the Five Moves method.
+
+    Args:
+        finding_description: Description of the finding (CVE, alert, detection).
+        branch_id: Branch ID to load for energy analysis.
+    """
+    return f"""\
+You are investigating a security finding using the Five Moves method.
+
+**Finding**: {json.dumps(finding_description)}
+**Branch**: {json.dumps(branch_id)}
+
+**Energy context**: Energy scores represent structural resistance — how much the
+infrastructure resists or accelerates an attacker along each edge.
+- Negative energy (accelerating): low resistance, attacker moves easily
+- Positive energy (braking): security barrier creates friction
+- Magnitude matters: -3.0 is much less resistance than -0.5
+
+Risk score bands (0-100, momentum model):
+- 0-20: strong structural resistance — well defended, not a finding
+- 20-40: moderate resistance — worth investigating controls and gaps
+- 40-60: low resistance — deserves attention
+- 60-80: little resistance — high priority for remediation
+- 80-100: almost no resistance — critical
+
+**IMPORTANT**: Energy scores tell you WHERE to look. They are NOT conclusions.
+Verify everything against source code, configuration, and cloud state.
+
+## The Five Moves
+
+### Move 1 — Ground
+Find the nodes related to this finding in the graph.
+    load_graph_energies(branch_id={json.dumps(branch_id)})
+    grep_nodes(pattern=<key terms from the finding>)
+
+If zero results, try broader terms (library name, service name, resource type).
+If still nothing, the finding may not be represented in the current graph — report
+that and stop.
+
+### Move 2 — Position
+Understand the structural position of affected nodes.
+    energy_node_scores(node_ids=<comma-separated affected node IDs>)
+    energy_node_neighborhood(node_id=<primary affected node>)
+
+What is the node connected to? Is it isolated or central? Does it have high
+connectivity (many edges) or low? Are there security boundaries nearby?
+
+### Move 3 — Trace
+Trace paths from the affected node to sensitive targets.
+    energy_trace_to_target(source_id=<affected_node>, target_types="data_store,credential,secrets_manager,database")
+
+Can an attacker reach crown jewels from this node? What resistance do they face?
+Which hops accelerate and which brake?
+
+### Move 4 — Score
+Score the full path for risk.
+    energy_momentum_path(path=<node_id_1,node_id_2,...>)
+
+Use the risk score bands above. Under 20 means the infrastructure defends this path.
+Over 40 means it deserves attention.
+
+### Move 5 — Verify
+Before concluding, verify against real infrastructure:
+- [ ] Check the version number — is the vulnerable version actually deployed?
+- [ ] Check feature usage — is the vulnerable feature enabled/used?
+- [ ] Check runtime configuration — are there mitigations not in the graph?
+- [ ] Check network access — can the attacker actually reach this node?
+- [ ] Check authentication — what credentials are needed?
+
+Present your findings with:
+1. Structural assessment (energy scores and what they mean)
+2. Path analysis (which paths exist, risk scores)
+3. Verification status (what you confirmed vs what needs manual verification)
+4. Recommendation (validate, dismiss, escalate)
+"""
+
+
+@mcp.prompt(
+    title="Research sweep",
+    description=(
+        "Systematic attack path discovery: entry points, structural queries, "
+        "path scoring, and submission. Uses energy tools throughout."
+    ),
+)
+def research_sweep(
+    branch_id: str,
+    focus_areas: str = "",
+) -> str:
+    """Systematic discovery of attack paths across the infrastructure.
+
+    Args:
+        branch_id: Branch ID to load for energy analysis.
+        focus_areas: Comma-separated areas to focus on (e.g. "credentials,iam,ci_cd").
+            Empty means sweep everything.
+    """
+    focus_hint = ""
+    if focus_areas:
+        focus_hint = f"""
+Focus your investigation on these areas: {json.dumps(focus_areas)}
+"""
+
+    return f"""\
+You are conducting a systematic attack path discovery sweep.
+
+**Branch**: {json.dumps(branch_id)}
+{focus_hint}
+**Energy context**: Risk score bands (0-100): 0-20 well defended, 20-40 moderate,
+40-60 needs attention, 60-80 high priority, 80-100 critical.
+
+## Phase 1 — Load and Orient
+
+    load_graph_energies(branch_id={json.dumps(branch_id)})
+    energy_entry_points()
+
+Identify the exposed surface: which nodes are reachable from outside the
+infrastructure? These are your starting points.
+
+## Phase 2 — Structural Queries by Category
+
+Search for high-value targets and risky patterns:
+
+**Credentials & secrets**:
+    grep_nodes(pattern="credential")
+    grep_nodes(pattern="secret")
+    find_nodes_by_type(node_type="credential")
+    find_nodes_by_type(node_type="secrets_manager")
+
+**Data stores**:
+    find_nodes_by_type(node_type="data_store")
+    find_nodes_by_type(node_type="database")
+    find_nodes_by_type(node_type="s3_bucket")
+
+**CI/CD & supply chain**:
+    grep_nodes(pattern="pipeline")
+    grep_nodes(pattern="deploy")
+    grep_nodes(pattern="ci")
+
+**IAM & identity**:
+    find_nodes_by_type(node_type="iam_role")
+    find_nodes_by_type(node_type="iam_policy")
+    find_nodes_by_type(node_type="service_account")
+
+## Phase 3 — Path Discovery
+
+For each entry point, find lowest-resistance paths to targets:
+    energy_lowest_paths(source_id=<entry_point>, limit=10)
+
+For specific source-target pairs of interest:
+    energy_trace_to_target(source_id=<entry>, target_types="credential,data_store,database,secrets_manager")
+
+## Phase 4 — Score and Evaluate
+
+For each discovered path:
+    energy_momentum_path(path=<node_id_1,node_id_2,...>)
+
+Classify paths by risk band:
+- Skip paths scoring < 20 (well defended)
+- Investigate paths scoring 20-40 (check specific controls)
+- Flag paths scoring > 40 (needs attention)
+- Prioritise paths scoring > 60 (high priority)
+
+## Phase 5 — Submit
+
+For paths scoring > 20/100 that represent real risk:
+    submit_attack_path(nodes="<node1> -> <node2> -> <node3>", description="...", report="...")
+
+Include in the report: energy per hop, compensating controls found, verification
+notes, and MITRE ATT&CK technique IDs where applicable.
+"""
+
+
+@mcp.prompt(
+    title="Triage discovery",
+    description=(
+        "Process scanner findings: read, cluster by remediation action, refine with "
+        "energy analysis. Phases 1-4 of the triage pipeline."
+    ),
+)
+def triage_discover(
+    sources: str,
+    branch_id: str,
+) -> str:
+    """Read findings, cluster by remediation, and refine with energy analysis.
+
+    Args:
+        sources: Comma-separated list of finding source files or descriptions.
+        branch_id: Branch ID to load for energy analysis.
+    """
+    return f"""\
+You are processing scanner findings through the structural triage pipeline.
+
+**Sources**: {json.dumps(sources)}
+**Branch**: {json.dumps(branch_id)}
+
+## Energy Method
+
+Energy scores represent structural resistance. Use them to PRIORITIZE, not to
+decide. The workflow:
+1. What does the energy say? (structural signal)
+2. What does the finding say? (scanner signal)
+3. What does the code/config say? (ground truth)
+
+Never skip step 3. Energy tells you where to look; the code tells you what's real.
+
+## Resolution Categories
+
+After investigation, each finding group resolves to one of:
+- **Eliminable**: Can be fully fixed (patch, config change, code fix)
+- **Reducible**: Can reduce severity (add controls, restrict access)
+- **Constrained**: Accepted risk with documented justification
+- **Drift-prone**: Fixed now but will recur without automation
+- **Mitigated**: Compensating controls make it low-priority
+
+## Phase 1 — Read All Findings
+
+Read the source files and extract every finding. For each, capture:
+- Finding ID / title
+- Severity (from the scanner)
+- Affected resource
+- Description
+
+## Phase 2 — Cluster by Remediation Action
+
+Group findings by what batch of work would fix them:
+- Same package upgrade? → one group
+- Same config change? → one group
+- Same IAM policy fix? → one group
+
+Name each group by the remediation action, not by the finding title.
+
+## Phase 3 — Energy Refinement
+
+    load_graph_energies(branch_id={json.dumps(branch_id)})
+
+For each group's anchor nodes:
+    energy_node_scores(node_ids=<comma-separated node IDs>)
+    energy_trace_to_target(source_id=<anchor_node>, target_types="credential,data_store,database")
+
+Use energy scores to:
+- Merge groups whose remediation overlaps
+- Split groups where energy reveals different risk profiles
+- Prioritize groups by structural exposure
+
+## Phase 4 — Assign Unclaimed Findings
+
+Any finding not yet in a group: find its nearest node in the graph with
+grep_nodes, check energy_node_scores, and assign to the group whose
+anchor node is structurally closest.
+
+Present the final grouping as a table:
+| Group | Remediation Action | Findings | Anchor Nodes | Structural Risk |
+"""
+
+
+@mcp.prompt(
+    title="Investigate a finding group",
+    description=(
+        "Deep investigation of one finding group using energy analysis and "
+        "verification against code/config/cloud."
+    ),
+)
+def triage_investigate_group(
+    group_description: str,
+    findings: str,
+    branch_id: str,
+    verification_channels: str = "",
+) -> str:
+    """Investigate a single finding group.
+
+    Args:
+        group_description: What this group is about (the remediation action).
+        findings: JSON array or comma-separated list of finding IDs/descriptions in this group.
+        branch_id: Branch ID (graph must already be loaded via load_graph_energies).
+        verification_channels: Comma-separated verification sources (e.g. "source_code,aws_cli,k8s").
+    """
+    verify_hint = ""
+    if verification_channels:
+        verify_hint = f"""
+Verification channels available: {json.dumps(verification_channels)}
+Use these to confirm or refute energy signals.
+"""
+
+    return f"""\
+You are investigating a finding group for structural triage.
+
+Prerequisites: load_graph_energies(branch_id) must have been called before using these tools.
+
+**Group**: {json.dumps(group_description)}
+**Findings**: {json.dumps(findings)}
+**Branch**: {json.dumps(branch_id)}
+{verify_hint}
+## Energy Interpretation
+
+Energy is structural resistance — negative means accelerating (low resistance), positive means braking (control/boundary). Magnitude matters: -3.0 is much less resistance than -0.5.
+
+Risk score bands: 0-20 well defended, 20-40 moderate, 40-60 needs attention, 60-80 high priority, 80-100 critical.
+
+Energy scores tell you WHERE to look. They are NOT conclusions. Verify everything against source code, configuration, and cloud state. Evidence hierarchy: source code > config files > cloud API > semantic context > graph structure > energy scores.
+
+## Investigation Steps
+
+### 1. Energy Analysis of Anchor Nodes
+    energy_node_scores(node_ids=<anchor nodes for this group>)
+
+What does the structural position tell us? High connectivity = more exposure.
+Security boundaries nearby = compensating controls.
+
+### 2. Structural Neighborhood
+    energy_node_neighborhood(node_id=<primary anchor node>)
+
+What surrounds this node? Are there auth checks, network boundaries, or
+other controls between it and sensitive targets?
+
+### 3. Path Tracing
+    energy_trace_to_target(source_id=<anchor_node>, target_types="credential,data_store,database,secrets_manager")
+
+Can an attacker reach crown jewels from the vulnerable nodes? What resistance
+do they face? Which hops have compensating controls?
+
+### 4. Verification
+
+For each energy signal, verify against ground truth:
+- If energy shows low resistance: check if there are controls not in the graph
+- If energy shows high resistance: confirm the control is actually effective
+- Check version numbers, feature flags, runtime configuration
+
+### 5. Verdict
+
+Produce a verdict for this group:
+- **Status**: confirmed / refuted / partial
+- **Resolution category**: eliminable / reducible / constrained / drift_prone / mitigated
+- **Evidence**: cite specific code, config, or cloud state
+- **Priority**: based on risk score band AND verification results
+- **Recommended action**: specific remediation steps
+"""
+
+
+@mcp.prompt(
+    title="Deliver triage report",
+    description=(
+        "Generate an audience-specific report from triage results. "
+        "Action table first, evidence from code/config, no model internals."
+    ),
+)
+def triage_deliver(
+    results: str,
+    audience_name: str,
+    audience_needs: str = "",
+    report_outline: str = "",
+) -> str:
+    """Generate an audience-specific triage report.
+
+    Args:
+        results: JSON string or description of triage investigation results.
+        audience_name: Who this report is for (e.g. "engineering_lead", "ciso", "platform_team").
+        audience_needs: What this audience cares about (e.g. "what to fix this sprint").
+        report_outline: Optional custom report structure.
+    """
+    outline_hint = ""
+    if report_outline:
+        outline_hint = f"""
+Follow this report outline: {json.dumps(report_outline)}
+"""
+
+    return f"""\
+You are generating a triage report for a specific audience.
+
+**Audience**: {json.dumps(audience_name)}
+**Needs**: {json.dumps(audience_needs) if audience_needs else "Not specified — use defaults for this audience type."}
+**Results**: {json.dumps(results)}
+{outline_hint}
+## Report Rules
+
+1. **Action table first**. The report opens with what to fix, who owns it, and
+   priority. Not a summary. Not context. The table.
+
+2. **Evidence from code and config, not energy scores**. Energy scores are
+   internal signals — they tell US where to look. The audience sees:
+   - "This IAM role grants s3:* to the build service account" (evidence)
+   - NOT "The energy score between iam-role-build and s3-prod is -2.7" (internal)
+
+3. **No model internals**. Never mention: energy scores, JEPA, momentum model,
+   structural resistance, braking/accelerating, node embeddings, or graph encoding.
+   These are implementation details the audience does not need.
+
+4. **No effort estimates**. We do not estimate engineering effort. The audience
+   knows their codebase better than we do.
+
+5. **No methodology sections**. Do not explain how the analysis was done.
+   Present findings as facts with evidence citations.
+
+## Report Structure (default)
+
+### Action Table
+| Priority | Finding | Owner | Remediation | Evidence |
+|----------|---------|-------|-------------|----------|
+
+### High-Priority Findings
+For each P1/P2 finding:
+- What is vulnerable and why
+- What an attacker could do (concrete scenario)
+- How to fix it (specific steps)
+- Evidence (code path, config file, cloud resource)
+
+### Accepted Risks
+Findings classified as constrained or mitigated, with documented justification.
+
+### Appendix
+Full finding list with resolution status.
+
+Filter everything for this audience. An engineering lead needs code paths and
+remediation steps. A CISO needs business impact and risk posture. A platform
+team needs infrastructure changes and ownership.
 """
 
 
@@ -3528,18 +3282,17 @@ def _stop_jepa_keepalive():
 
 @mcp.tool()
 async def load_graph_energies(branch_id: str) -> str:
-    """Load an infrastructure graph with JEPA energy scores for structural triage.
+    """Load an infrastructure graph with energy scores into the local cache.
 
-    Fetches the full graph from InfraDB and energy scores from the inference
-    server, merging them into a local cache. All energy_* and grep_* tools
+    This is the single entry point for all graph and energy analysis. It:
+    1. Checks the local SQLite disk cache — returns immediately if fresh
+    2. Triggers warm-up (encoding) on the inference server
+    3. Polls until encoding completes (2-5 min for large graphs)
+    4. Fetches the full graph and energy scores from the inference server
+    5. Merges everything into a local SQLite cache
+
+    All energy_*, grep_*, read_*, find_*, and get_graph_statistics tools
     require this to be called first.
-
-    For large graphs (1000+ nodes), the first load triggers JEPA encoding which
-    takes 2-5 minutes. Use oracle_load_branch first to warm the disk cache with
-    progress updates, then call this tool — it will be fast (~10s).
-
-    If you haven't loaded via oracle first, this tool will trigger encoding
-    directly but without progress updates.
     """
     global _energy_cache
 
@@ -3564,6 +3317,36 @@ async def load_graph_energies(branch_id: str) -> str:
             "has_energies": cached.has_energies,
         })
 
+    try:
+        client = await _http()
+    except DeviceFlowPending as e:
+        return json.dumps(_auth_pending_response(e))
+
+    # --- JEPA warm-up: trigger encoding and wait for completion ---
+    # This replaces the old load_branch + wait_for_load sequence.
+    # The inference session is used internally to trigger and poll encoding.
+    try:
+        log.info("load_graph_energies: triggering JEPA warm-up for branch %s", branch_id)
+        load_result = await load_branch(branch_id)
+        load_data = json.loads(load_result)
+
+        if load_data.get("status") != "loaded":
+            # Encoding started but not instant — poll until ready
+            log.info("load_graph_energies: encoding in progress, waiting...")
+            wait_result = await wait_for_load(timeout_secs=600, poll_interval=15)
+            wait_data = json.loads(wait_result)
+            if wait_data.get("status") == "timeout":
+                log.warning("load_graph_energies: JEPA warm-up timed out, proceeding anyway")
+            elif wait_data.get("status") == "loaded":
+                log.info("load_graph_energies: JEPA encoding complete")
+    except Exception as exc:
+        # JEPA warm-up failure is non-fatal — we still try to fetch the graph
+        # and energies. The energy fetch may fail too, but graph tools will work.
+        log.warning("load_graph_energies: JEPA warm-up failed (%s), proceeding with graph fetch", exc)
+
+    # --- Fetch graph + energies into local cache ---
+    # Re-acquire the client — the JEPA warm-up above may have recreated it
+    # (e.g., the original was closed and _http() built a new one).
     try:
         client = await _http()
     except DeviceFlowPending as e:
@@ -3622,9 +3405,8 @@ async def load_graph_energies(branch_id: str) -> str:
         result["energy_error"] = cache.energy_error
         result["next_step"] = (
             "Graph tools (read_node, grep_nodes, find_nodes_by_type, etc.) work. "
-            "Energy tools require JEPA energy scores. To load them: "
-            "oracle_load_branch(branch_id) → oracle_wait_for_load() → "
-            "then retry load_graph_energies(branch_id)."
+            "Energy tools require energy scores — retry "
+            "load_graph_energies(branch_id) in a few minutes."
         )
     if cache.energies_incomplete:
         result["warning"] = (

@@ -11,7 +11,7 @@ Walk the user through connecting to Latent Defense step by step, explaining each
 
 ## Input
 
-The portal URL must be provided as the argument (e.g., `https://portal.acme-corp.latentdefense.ai`). If not provided, ask for it.
+The portal URL must be provided as the argument (e.g., `https://portal.acme-corp.com`). If not provided, ask for it.
 
 ## Step 1 — Validate the endpoint
 
@@ -137,13 +137,11 @@ List the skills that will be installed:
 | Skill | What it does |
 |-------|-------------|
 | `/map` | Scan infrastructure — select scope, credentials, run mapping |
-| `/research` | Explore the graph, build threat models, run attack path analysis |
+| `/research` | Explore the graph, run structural queries, discover attack paths |
 | `/investigate` | Answer security posture questions, triage detections/CVEs |
-| `/triage` | Review and validate discovered attack paths |
-| `/remediate` | Create remediation tickets from validated paths |
-| `/monitor` | Configure scan schedules and webhook alerts |
-| `/status` | Quick health dashboard |
-| `/health-check` | Full deployment validation |
+| `/triage` | Structural triage of scanner findings at scale |
+| `/build` | Integrations — webhooks, scan schedules, SIEM export, connectors |
+| `/status` | Deployment health check (`/status deep` for full validation) |
 
 Ask: "Should I install these skills?" Wait for confirmation.
 
@@ -249,7 +247,7 @@ If everything is healthy:
 > Setup complete. You're connected to Latent Defense. Try one of these to get started:
 > - `/status` — see what's in your deployment right now
 > - `/map` — run your first infrastructure scan
-> - `/health-check` — full deployment validation
+> - `/status deep` — full deployment validation
 
 If there are issues, explain each one and how to fix it.
 

@@ -3,9 +3,7 @@
 Records one event per tool call at the FastMCP dispatch boundary.
 Failures are always suppressed so telemetry never interrupts tool callers.
 
-Event flow:
-    mcp-server → portal → telemetry-collector → NATS → blob →
-    telemetry-platform (tagged with the deployment's customer_id)
+Events are forwarded to the deployment's telemetry endpoint.
 
 Identity contract
 -----------------
@@ -84,7 +82,7 @@ async def emit_mcp_call_event(
     error_type: str | None,
     server_name: str = "latent-defense",
 ) -> None:
-    """Post one mcp_call_event to the deployment's telemetry-collector."""
+    """Post one mcp_call_event to the deployment's telemetry endpoint."""
     try:
         entity_id = await _resolve_entity_id(http_factory)
         payload: dict[str, Any] = {

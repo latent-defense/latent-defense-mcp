@@ -1,7 +1,7 @@
-"""MCP triage parity — new tools and updated tools (LD-2190).
+"""MCP triage parity — new tools and updated tools.
 
-Tests for: add_path_comment (InfraDB writes, threading, agent attribution),
-edit_path_comment, get_triage_config, get_classification_stats.
+Tests for: add_path_comment (infrastructure database writes, threading, agent attribution),
+edit_path_comment, get_triage_config, triage_stats(view="classification").
 
 Monkeypatches the ``_get`` / ``_post`` HTTP seams (matching test_path_comments.py).
 """
@@ -18,13 +18,13 @@ _INFRA_RECORDS_PATH = "/api/infra/records"
 
 
 # ---------------------------------------------------------------------------
-# add_path_comment — InfraDB write, threading, agent attribution
+# add_path_comment — infrastructure database write, threading, agent attribution
 # ---------------------------------------------------------------------------
 
 
 class TestAddPathComment:
     async def test_writes_to_infradb_records(self, monkeypatch):
-        """add_path_comment writes to InfraDB records, not triage comments."""
+        """add_path_comment writes to infrastructure database records, not triage comments."""
         posted: dict = {}
 
         async def fake_post(path, body=None, *, _tool=""):
@@ -59,7 +59,7 @@ class TestAddPathComment:
         assert data["agent_name"] == "claude"
 
     async def test_threading_parent_comment_id(self, monkeypatch):
-        """parent_comment_id is forwarded to the InfraDB record."""
+        """parent_comment_id is forwarded to the infrastructure database record."""
         posted: dict = {}
 
         async def fake_post(path, body=None, *, _tool=""):
@@ -141,10 +141,10 @@ class TestAddPathComment:
 
         monkeypatch.setattr(server, "_post", fake_post)
         result = json.loads(
-            await server.add_path_comment("p1", "text", author="alice@x.io")
+            await server.add_path_comment("p1", "text", author="alice@example.com")
         )
 
-        assert result["author"] == "alice@x.io"
+        assert result["author"] == "alice@example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ class TestAddPathComment:
 # ---------------------------------------------------------------------------
 
 
-def _infra_record(comment_id, text, at, author="alice@x.io",
+def _infra_record(comment_id, text, at, author="alice@example.com",
                   parent_comment_id=None, author_kind=None, agent_name=None):
     data = {
         "comment_id": comment_id,
@@ -192,15 +192,25 @@ def _route(records=None, legacy=None):
     return fake_get
 
 
-class TestListPathCommentsAttribution:
+class TestListPathHistoryCommentsAttribution:
     async def test_surfaces_author_kind_and_agent_name(self, monkeypatch):
-        """author_kind and agent_name from InfraDB data are surfaced."""
-        rec = _infra_record(
-            "c1", "agent note", "2026-01-01T00:00:00Z",
-            author_kind="agent", agent_name="claude-opus-4",
-        )
-        monkeypatch.setattr(server, "_get", _route(records=[rec]))
-        result = json.loads(await server.list_path_comments("p1"))
+        """author_kind and agent_name are surfaced when filtering to comments."""
+        events = [
+            {
+                "event_type": "comment",
+                "comment_id": "c1",
+                "text": "agent note",
+                "at": "2026-01-01T00:00:00Z",
+                "author_kind": "agent",
+                "agent_name": "claude-opus-4",
+            },
+        ]
+
+        async def fake_get(path, *, _tool="", **params):
+            return events
+
+        monkeypatch.setattr(server, "_get", fake_get)
+        result = json.loads(await server.list_path_history("p1", include="comments"))
 
         assert len(result) == 1
         assert result[0]["author_kind"] == "agent"
@@ -208,9 +218,22 @@ class TestListPathCommentsAttribution:
 
     async def test_human_comments_have_null_agent_fields(self, monkeypatch):
         """Human comments have null author_kind and agent_name."""
-        rec = _infra_record("c1", "human note", "2026-01-01T00:00:00Z")
-        monkeypatch.setattr(server, "_get", _route(records=[rec]))
-        result = json.loads(await server.list_path_comments("p1"))
+        events = [
+            {
+                "event_type": "comment",
+                "comment_id": "c1",
+                "text": "human note",
+                "at": "2026-01-01T00:00:00Z",
+                "author_kind": None,
+                "agent_name": None,
+            },
+        ]
+
+        async def fake_get(path, *, _tool="", **params):
+            return events
+
+        monkeypatch.setattr(server, "_get", fake_get)
+        result = json.loads(await server.list_path_history("p1", include="comments"))
 
         assert result[0]["author_kind"] is None
         assert result[0]["agent_name"] is None
@@ -241,7 +264,7 @@ class TestEditPathComment:
         monkeypatch.setattr(server, "_post", fake_post)
         result = json.loads(await server.edit_path_comment("p1", "c1", "updated"))
 
-        # Written to InfraDB records
+        # Written to infrastructure database records
         assert posted["path"] == _INFRA_RECORDS_PATH
         # New key (not the original)
         assert posted["body"]["key_id"] != "c1"
@@ -342,9 +365,9 @@ class TestGetTriageConfig:
 # ---------------------------------------------------------------------------
 
 
-class TestGetClassificationStats:
+class TestTriageStatsClassification:
     async def test_returns_stats(self, monkeypatch):
-        """get_classification_stats wraps GET /api/triage/stats/classification."""
+        """triage_stats(view='classification') wraps GET /api/triage/stats/classification."""
         seen: dict = {}
 
         async def fake_get(path, *, _tool="", **params):
@@ -353,7 +376,7 @@ class TestGetClassificationStats:
             return {"true_positive": 10, "false_positive": 3}
 
         monkeypatch.setattr(server, "_get", fake_get)
-        result = json.loads(await server.get_classification_stats())
+        result = json.loads(await server.triage_stats(view="classification"))
 
         assert seen["path"] == "/api/triage/stats/classification"
         assert result["true_positive"] == 10
@@ -367,7 +390,7 @@ class TestGetClassificationStats:
             return {}
 
         monkeypatch.setattr(server, "_get", fake_get)
-        await server.get_classification_stats(repository_id="repo-1")
+        await server.triage_stats(repository_id="repo-1", view="classification")
 
         assert seen["params"]["repository_id"] == "repo-1"
 
@@ -380,7 +403,7 @@ class TestGetClassificationStats:
             return {}
 
         monkeypatch.setattr(server, "_get", fake_get)
-        await server.get_classification_stats(repository_id="")
+        await server.triage_stats(repository_id="", view="classification")
 
         assert "repository_id" not in seen["params"]
 
@@ -398,8 +421,7 @@ class TestToolRegistration:
             "add_path_comment",
             "edit_path_comment",
             "get_triage_config",
-            "get_classification_stats",
-            "list_path_comments",
+            "list_path_history",
             "triage_stats",
         ):
             assert name in tools, f"{name} not registered"
@@ -409,3 +431,5 @@ class TestToolRegistration:
         prompts = {p.name for p in await server.mcp.list_prompts()}
         for name in ("triage_queue_review", "assess_cve", "chokepoint_report"):
             assert name in prompts, f"{name} not registered"
+
+# cmv2 multi-repo probe

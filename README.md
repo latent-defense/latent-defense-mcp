@@ -13,7 +13,7 @@ cd your-project
 python3 -m latent_defense_mcp.init
 
 # 3. Edit .mcp.json — set LATENT_DEFENSE_URL to your portal
-#    (looks like https://portal-<name>.latentdefense.ai or a custom domain)
+#    (looks like https://portal.your-deployment.com)
 
 # 4. Authenticate before restarting Claude Code
 latent-defense-mcp-login https://portal.your-deployment.com
@@ -56,7 +56,7 @@ python3 -m latent_defense_mcp.init
 
 This creates:
 - `.mcp.json` — MCP server configuration with the binary path auto-detected
-- `.claude/skills/` — 11 guided workflow skills
+- `.claude/skills/` — 19 guided workflow skills (13 top-level + sub-skills)
 
 #### 3. Set your portal URL
 
@@ -168,14 +168,18 @@ Skills are guided workflows that walk Claude through multi-step tasks. They're i
 | Skill | Command | What it does |
 |-------|---------|-------------|
 | **Setup** | `/setup <url>` | Connect to a Latent Defense deployment (automatic or interactive mode) |
+| **Tutorial** | `/tutorial` | Interactive walkthrough of energy scores, risk bands, and path tracing |
+| **My Data** | `/my-data` | See everything in your deployment — repos, graphs, paths, connectors |
+| **Explore** | `/explore` | Browse infrastructure graph — entry points, crown jewels, choke points |
+| **Investigate** | `/investigate` | Investigate specific CVEs, detections, or security posture questions |
+| **Triage** | `/triage` | Structural security triage at scale with parallel sub-agents |
+| **Research** | `/research` | Proactive attack path discovery against the energy graph |
+| **Review** | `/review` | Review attack paths in the triage queue with energy context |
+| **Diff** | `/diff` | Compare two graph snapshots — see what changed between commits or branches |
 | **Map** | `/map` | Scan infrastructure — select scope, credentials, monitor progress |
-| **Research** | `/research` | Explore graphs, build threat models, proactively discover attack paths |
-| **Investigate** | `/investigate` | Investigate specific detections, CVEs, or security posture questions |
-| **Triage** | `/triage` | Review and validate discovered attack paths |
-| **Remediate** | `/remediate` | Create remediation tickets from validated paths |
-| **Monitor** | `/monitor` | Configure scan schedules and webhook alerts |
-| **Status** | `/status` | Quick health dashboard |
-| **Health Check** | `/health-check` | Full deployment validation (services, connectors, ticketing) |
+| **Rerun Inference** | `/rerun-inference` | Re-run JEPA inference after remapping or remediation |
+| **Build** | `/build` | Build integrations — webhooks, scan schedules, connectors, SIEM |
+| **Status** | `/status` | Deployment health check (use `/status deep` for full validation) |
 
 > `/setup-headless` and `/setup-interactive` are sub-modes of `/setup` and are also available as standalone skills.
 
@@ -260,7 +264,6 @@ Use difficulty as a ranking signal to prioritize paths relative to each other wi
 | `list_mapping_runs` | List recent mapping runs |
 | `list_mapping_agents` | List agents spawned by a run with per-agent status |
 | `cancel_mapping_run` | Cancel a running mapping run |
-| `trigger_scan` | Trigger a scan with dedup and rate limiting |
 | `list_trigger_events` | List recent trigger events |
 | `trigger_stats` | Active runs, rate limiting state, failure counts |
 | `list_scan_schedules` | List recurring scan schedules |
@@ -279,9 +282,8 @@ Use difficulty as a ranking signal to prioritize paths relative to each other wi
 | `create_branch` | Fork a branch for analysis |
 | `list_commits` | List commits on a branch |
 | `diff_commits` | Diff two commits — added/removed/modified nodes and edges |
-| `search_nodes` | Search nodes by name substring (use oracle_search_nodes for semantic search) |
+| `search_nodes` | Search nodes by name substring (use grep_nodes for local cache search or energy_node_scores for energy-aware search) |
 | `infra_stats` | Overall stats — repo count, total nodes/edges |
-| `list_branch_attack_paths` | List attack paths stored on a branch (pre-triage analysis output) |
 
 ### Attack path analysis
 
@@ -303,28 +305,18 @@ Use difficulty as a ranking signal to prioritize paths relative to each other wi
 | `get_attack_path` | Get full path details with MITRE ATT&CK mappings and energy breakdown |
 | `update_path_status` | Update triage status |
 | `validate_path` | Dispatch for sandbox validation |
-| `triage_stats` | Counts by status, severity, repository |
 | `get_validation_status` | Check sandbox validation progress |
-
-### Ticketing
-
-| Tool | Description |
-|------|-------------|
-| `list_tickets` | List remediation tickets |
-| `get_ticket` | Get ticket details — linked path, status, external URL |
-| `create_remediation_ticket` | Create a ticket from a validated attack path |
-| `configure_ticket_provider` | Set up a ticketing provider (Jira, Linear, GitHub Issues, ServiceNow, PagerDuty, Airtable, Asana, or custom webhook) |
-| `test_ticket_provider` | Verify ticketing credentials |
-| `ticket_stats` | Ticket counts and provider health |
-| `get_ticket_steps` | Get per-iteration remediation progress for a ticket |
-| `update_ticket_status` | Update a ticket's status |
-| `sync_ticket` | Force sync ticket status from upstream provider |
-| `retry_ticket` | Re-run remediation from a failed ticket |
-| `get_ticket_provider` | Get active provider and all configured providers |
-| `set_active_ticket_provider` | Switch the active ticketing provider |
-| `remove_ticket_provider` | Remove a configured ticketing provider |
-| `get_ticket_template_variables` | List Jinja2 template variables for custom ticket bodies |
-| `preview_ticket_template` | Preview a ticket template against sample data |
+| `dismiss_path` | Dismiss an attack path from active triage |
+| `undismiss_path` | Restore a dismissed path to active triage |
+| `override_risk_score` | Manually override a path's risk score |
+| `clear_risk_override` | Remove a manual risk score override |
+| `add_path_comment` | Add a comment to an attack path |
+| `edit_path_comment` | Edit an existing path comment |
+| `bulk_update_paths` | Batch-update status on multiple paths |
+| `list_path_history` | Audit log of status changes on a path |
+| `submit_attack_path` | Submit a discovered attack path for scoring and triage |
+| `get_triage_config` | Get triage configuration (thresholds, auto-dismiss rules) |
+| `triage_stats` | Counts by status, severity, repository |
 
 ### Webhooks
 
@@ -352,33 +344,60 @@ Use difficulty as a ranking signal to prioritize paths relative to each other wi
 | `ingest_stats` | Get ingestion statistics |
 | `test_connector` | Test a connector without persisting data |
 
-### Interactive analysis (oracle)
-
-These tools power `/research` and `/investigate`. They manage an oracle session automatically.
-
-These tools manage an interactive analysis session. The `oracle_` prefix identifies tools that operate within a loaded graph session. Tools prefixed with `tm_` operate on the **threat model** — an abstract attack pattern you build and then match against real infrastructure.
+### Foundation
 
 | Tool | Description |
 |------|-------------|
-| `oracle_load_branch` | Load a branch for analysis (2-5 min for large graphs) |
-| `oracle_load_status` | Check encoding progress |
-| `oracle_graph_info` | Loaded graph stats — node/edge counts, type distribution |
-| `oracle_list_nodes` | Browse nodes by type |
-| `oracle_get_node` | Semantic node lookup with full neighbor details |
-| `oracle_search_nodes` | Search for components by description |
-| `oracle_tm_add_node` | Add a node to the threat model |
-| `oracle_tm_add_edge` | Add an edge to the threat model |
-| `oracle_tm_show` | View current threat model |
-| `oracle_tm_clear` | Clear and start fresh |
-| `oracle_tm_match` | Match against real infrastructure — Mermaid diagram with scores |
-| `oracle_tm_match_refine` | Energy-scored refinement with per-hop transitions |
-| `oracle_tm_list_templates` | List built-in threat model templates |
-| `oracle_tm_load_template` | Load a template |
-| `oracle_tm_save` | Save as reusable template |
-| `oracle_submit_attack_path` | Submit a discovered path to triage |
-| `oracle_submit_matched_path` | Submit matched paths from current threat model |
-| `oracle_reset_session` | Destroy session and start fresh |
-| `oracle_wait_for_load` | Wait for graph loading to complete (blocks until ready or timeout) |
+| `load_graph_energies` | Load a graph and fetch JEPA energy scores into a local cache — required before any graph or energy tool |
+| `load_branch` | Load a branch into the JEPA encoder (use `load_graph_energies` for the full workflow) |
+| `wait_for_load` | Wait for graph encoding to complete after `load_branch()` |
+
+### Energy analysis
+
+The platform provides energy analysis tools for structural scoring and path tracing. Load a graph with `load_graph_energies(branch_id)`, then use the energy tools for structural analysis, path tracing, and chokepoint discovery.
+
+| Tool | Description |
+|------|-------------|
+| `energy_node_scores` | Energy scores for a set of nodes |
+| `energy_edge_scores` | Energy scores for edges between nodes |
+| `energy_momentum_path` | Score a path using the momentum model (0–100 risk) |
+| `energy_lowest_hop` | Find the lowest-energy hop from a node |
+| `energy_lowest_paths` | Discover lowest-energy paths between nodes |
+| `energy_trace_to_target` | Trace energy-guided paths to a target |
+| `energy_compare_paths` | Compare energy profiles of multiple paths |
+| `energy_node_neighborhood` | Energy landscape around a node |
+| `energy_entry_points` | Find entry points with lowest energy barriers |
+| `energy_defenses` | Identify defensive controls (braking energy) |
+| `energy_top_attack_paths` | Discover top attack paths by energy |
+| `energy_chokepoints` | Find infrastructure chokepoints |
+
+### Graph tools
+
+| Tool | Description |
+|------|-------------|
+| `read_node` | Read a node's full details from the cached graph |
+| `read_edge` | Read an edge's details |
+| `get_connected_edges` | Get all edges connected to a node |
+| `get_graph_statistics` | Graph summary — node/edge counts by type |
+| `grep_nodes` | Search nodes by name or description in the local cache |
+| `grep_edges` | Search edges in the local cache |
+| `find_nodes_by_type` | Find all nodes of a given type |
+| `find_edges_by_type` | Find all edges of a given type |
+
+### Session state
+
+| Tool | Description |
+|------|-------------|
+| `triage_save_user` | Save user profile (role, preferences, integrations) |
+| `triage_load_user` | Load user profile |
+| `triage_save_project` | Save project state (branch, findings, verdicts) |
+| `triage_load_project` | Load project state |
+| `triage_list_projects` | List all triage projects |
+| `triage_project_status` | Project status summary |
+| `triage_update_finding_group` | Update a finding group's status |
+| `triage_add_work_item` | Add a work item to a project |
+| `triage_add_decision` | Record a risk decision |
+| `triage_get_workflow_args` | Get workflow arguments for pipeline execution |
 
 ### Introspection
 

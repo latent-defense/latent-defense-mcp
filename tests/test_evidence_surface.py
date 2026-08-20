@@ -1,18 +1,17 @@
-"""LD-1177: the new node/step evidence metadata must survive the MCP tool surface.
+"""Evidence metadata surfacing through get_attack_path and list_attack_paths.
 
-Attack-path steps and graph nodes now carry structured evidence (``source_ref`` +
+Attack-path steps and graph nodes carry structured evidence (``source_ref`` +
 ``evidence``) plus the per-step rationale inference emits
 (``energy`` / ``edge_type`` / ``implicit`` / ``match_confidence``). The MCP tools
 forward the upstream response generically — ``get_attack_path`` and
 ``list_attack_paths(summary=False)`` return the full path dict (only a handful of
-internal bookkeeping keys are dropped), and the oracle node tools forward the
-oracle response verbatim via ``_oracle_call``.
+internal bookkeeping keys are dropped).
 
-These tests monkeypatch the HTTP seams (``_get`` / ``_oracle_call``) so no live
-server is needed, and pin that the new fields reach the returned shape. They also
-pin the deliberate carve-out: ``list_attack_paths(summary=True)`` (the default)
-intentionally collapses steps to a count, so step evidence is surfaced through the
-full-detail tools, not the summary view.
+These tests monkeypatch the ``_get`` HTTP seam so no live server is needed, and
+pin that the new fields reach the returned shape. They also pin the deliberate
+carve-out: ``list_attack_paths(summary=True)`` (the default) intentionally
+collapses steps to a count, so step evidence is surfaced through the full-detail
+tools, not the summary view.
 """
 
 import json
@@ -25,7 +24,7 @@ from latent_defense_mcp import server
 pytestmark = pytest.mark.asyncio
 
 
-# Shapes mirror the LD-1177 shared contract.
+# Shapes mirror the shared evidence contract.
 _SOURCE_REF = {
     "repo_url": "https://github.com/org/repo",
     "commit": "abc123",
@@ -48,7 +47,7 @@ def _make_step():
         "step_index": 0,
         "technique": "assume_role",
         "description": "Assume the over-permissive role",
-        # LD-1177 typed rationale fields (alongside legacy metadata).
+        # Typed rationale fields (alongside legacy metadata).
         "energy": 1.23,
         "edge_type": "assumes_role",
         "implicit": True,
@@ -143,50 +142,4 @@ class TestListAttackPathsSurfacesEvidence:
         assert "steps" not in item
 
 
-class TestOracleNodeToolsSurfaceEvidence:
-    async def test_oracle_get_node_forwards_node_metadata(self, monkeypatch):
-        node_payload = {
-            "name": "over-permissive-role",
-            "node_type": "iam_role",
-            "metadata": {"source_ref": _SOURCE_REF, "evidence": _EVIDENCE},
-        }
-
-        async def fake_require():
-            return None
-
-        async def fake_oracle_call(method, params=None, *, _tool=""):
-            assert method == "get_node"
-            return json.dumps(node_payload)
-
-        monkeypatch.setattr(server, "_require_loaded_graph", fake_require)
-        monkeypatch.setattr(server, "_oracle_call", fake_oracle_call)
-
-        out = json.loads(await server.oracle_get_node("the role"))
-        assert out["metadata"]["source_ref"] == _SOURCE_REF
-        assert out["metadata"]["evidence"] == _EVIDENCE
-
-    async def test_oracle_search_nodes_forwards_node_metadata(self, monkeypatch):
-        results_payload = {
-            "results": [
-                {
-                    "name": "over-permissive-role",
-                    "node_type": "iam_role",
-                    "metadata": {"source_ref": _SOURCE_REF, "evidence": _EVIDENCE},
-                }
-            ]
-        }
-
-        async def fake_require():
-            return None
-
-        async def fake_oracle_call(method, params=None, *, _tool=""):
-            assert method == "search_nodes"
-            return json.dumps(results_payload)
-
-        monkeypatch.setattr(server, "_require_loaded_graph", fake_require)
-        monkeypatch.setattr(server, "_oracle_call", fake_oracle_call)
-
-        out = json.loads(await server.oracle_search_nodes("role"))
-        node = out["results"][0]
-        assert node["metadata"]["source_ref"] == _SOURCE_REF
-        assert node["metadata"]["evidence"] == _EVIDENCE
+# Node evidence tests deprecated — use read_node and get_connected_edges.

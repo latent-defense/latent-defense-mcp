@@ -1,7 +1,8 @@
-"""LD-2053: MCP prompts — agentic triage workflows that replace the portal Research tab.
+"""MCP prompts — agentic triage workflows that replace the portal Research tab.
 
 Three prompts: ``triage_queue_review`` (independent), ``assess_cve`` and
-``chokepoint_report`` (both depend on ``paths_through_node``, LD-2052, now merged).
+``chokepoint_report`` (both use ``list_attack_paths`` with ``node_id`` filter
+and energy tools for structural analysis).
 
 The prompt functions are pure (they build an instruction string from their args and
 touch no HTTP seam), so these tests need no live server or monkeypatching.
@@ -144,7 +145,7 @@ async def test_assess_cve_arguments():
         p for p in await server.mcp.list_prompts() if p.name == "assess_cve"
     )
     arg_names = {a.name for a in (prompt.arguments or [])}
-    assert arg_names == {"cve_id", "repository_id"}
+    assert arg_names == {"cve_id", "repository_id", "branch_id"}
 
 
 async def test_assess_cve_renders_well_formed():
@@ -153,9 +154,9 @@ async def test_assess_cve_renders_well_formed():
     text = result.messages[0].content.text
 
     assert "CVE-2024-1234" in text
-    assert "search_nodes(" in text
-    assert "oracle_search_nodes(" in text
-    assert "paths_through_node(" in text
+    assert "grep_nodes(" in text
+    assert "list_attack_paths(" in text
+    assert "energy_node_scores(" in text
     assert "risk_score" in text.lower() or "risk" in text.lower()
 
 
@@ -189,7 +190,7 @@ async def test_chokepoint_report_arguments():
         p for p in await server.mcp.list_prompts() if p.name == "chokepoint_report"
     )
     arg_names = {a.name for a in (prompt.arguments or [])}
-    assert arg_names == {"repository_id", "min_paths"}
+    assert arg_names == {"branch_id", "repository_id", "min_paths"}
 
 
 async def test_chokepoint_report_renders_well_formed():
@@ -198,7 +199,7 @@ async def test_chokepoint_report_renders_well_formed():
     text = result.messages[0].content.text
 
     assert "list_attack_paths(" in text
-    assert "paths_through_node(" in text
+    assert "energy_chokepoints(" in text
     assert "chokepoint" in text.lower()
     # Default min_paths=3
     assert "3" in text

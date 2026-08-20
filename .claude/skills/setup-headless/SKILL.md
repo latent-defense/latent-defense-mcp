@@ -11,7 +11,7 @@ Configure the Latent Defense MCP server automatically. This skill writes all con
 
 ## Input
 
-The portal URL must be provided as the argument (e.g., `https://portal.acme-corp.latentdefense.ai`). If not provided, ask for it.
+The portal URL must be provided as the argument (e.g., `https://portal.acme-corp.com`). If not provided, ask for it.
 
 ## Step 1 — Validate the endpoint
 
@@ -183,13 +183,11 @@ If both pass, tell the user:
 
 > Setup complete. Your available skills:
 > - `/map` — scan infrastructure
-> - `/research` — explore the graph and build threat models
+> - `/research` — explore the graph and discover attack paths
 > - `/investigate` — answer security posture questions
-> - `/triage` — review and validate attack paths
-> - `/remediate` — create remediation tickets
-> - `/monitor` — configure schedules and webhooks
-> - `/status` — quick health dashboard
-> - `/health-check` — full deployment validation
+> - `/triage` — structural triage of scanner findings at scale
+> - `/build` — integrations — webhooks, scan schedules, SIEM export, connectors
+> - `/status` — deployment health check (`/status deep` for full validation)
 
 If `connection_status()` or `whoami()` fail, troubleshoot:
 - 401 → token may not have saved; re-run the auth step above

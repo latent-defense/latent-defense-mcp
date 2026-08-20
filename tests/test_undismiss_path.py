@@ -1,8 +1,7 @@
-"""Tests for the undismiss_path MCP tool (LD-2256, spec §E4).
+"""Tests for the undismiss_path MCP tool.
 
 undismiss_path reopens a dismissed (false_positive) attack path back into the
-triage queue. There is NO dedicated /undismiss endpoint (WS-B B1/LD-2244 was
-cancelled): the tool is a thin wrapper over the existing
+triage queue. There is no dedicated /undismiss endpoint. The tool is a thin wrapper over the existing
 PATCH /api/triage/paths/{id}/status, moving the path to `acknowledged`
 (a valid false_positive → acknowledged FORWARD_TRANSITION that clears the
 dismiss fields server-side). The reason/note are attached to the resulting
