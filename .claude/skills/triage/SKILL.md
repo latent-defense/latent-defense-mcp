@@ -21,22 +21,22 @@ Seven phases: **Load → Discover → Group → Sweep → Investigate → Route 
 
 **Load** — Loads the infrastructure graph with JEPA energy scores into a local SQLite cache. One agent, runs once. All subsequent agents query the same cache.
 
-**Discover** — One agent reads ALL findings across all sources and identifies 8-20 high-level remediation clusters. Groups by fix action, not surface attribute: "all services missing authentication" is one cluster regardless of service name. The agent identifies patterns — it doesn't assign individual findings yet.
+**Discover** — One agent loads ALL findings into the findings store via `load_findings`, reviews the distribution with `findings_stats`, and creates 8-20 remediation groups via `create_group`. Groups by fix action, not surface attribute. The agent then claims findings for each group using `claim_findings_by_query` (with dry_run preview) and `claim_findings_range` for contiguous scanner blocks.
 
-**Group** — Parallel agents, one per cluster, each claim specific findings by 0-based index. They read the findings, match to the cluster's description, and either terminate as a leaf (one fix covers all) or split into sub-groups. Energy tools guide split decisions:
-- Entry energy spread > 2.0 across a cluster's findings → SPLIT by exposure zone (some exposed, some interior)
-- `energy_trace_to_target` between two anchors returns "not reachable" → SPLIT (structurally disconnected)
+**Group** — Parallel agents, one per group, refine claims using the query-based claim tools. Each agent uses `query_findings` to review its findings and `claim_findings_by_query` to grab any unclaimed findings that belong. Energy tools guide split decisions:
+- Entry energy spread > 2.0 across a group's findings → SPLIT by exposure zone
+- `energy_trace_to_target` between two anchors returns "not reachable" → SPLIT (disconnected)
 - All findings anchor to similar-energy nodes → keep together
 
-A global tracker prevents double-claims across parallel agents. The recursion terminates at leaf groups or depth limit.
+The findings store prevents double-claims atomically — a finding belongs to exactly one group.
 
 **Why group before anchoring:** Most scanner findings (OS package CVEs) don't have graph nodes. `libdb5.3` isn't in the graph; the database-proxy service that contains it is. A parent agent recognizes "these are all OS package CVEs in the database-proxy image" from finding text alone — no graph needed. Energy tools then anchor the group as a whole. One intelligent anchoring per group, not thousands of mechanical anchoring attempts per CVE.
 
-**Sweep** — One agent handles unclaimed findings. Uses cross-references from Group agents and energy proximity to assign each to an existing group or create new ones. After sweep: every finding claimed exactly once.
+**Sweep** — One agent queries unclaimed findings with `query_findings(unclaimed_only=true)` and assigns each to the closest group via `claim_findings` or creates new groups. After sweep: `findings_stats` confirms 0 unclaimed.
 
 **Investigate** — Two-stage pipeline per group:
-- Stage 1 (Explore): Energy-only. Maps structural position using `energy_node_scores`, `energy_lowest_hop`, `energy_trace_to_target`. Produces: where does this sit, what controls exist, what's reachable, what files should the verifier check?
-- Stage 2 (Verify): Code/config verification. Gets the structural map, reads actual source code or configuration via the configured verification channels. Produces a verdict (confirmed / refuted / partial) with evidence cited from code, not from the graph.
+- Stage 1 (Explore): Energy-only. Reads group findings via `query_findings(group_id=X)`. Maps structural position using energy tools. Saves results via `save_investigation`.
+- Stage 2 (Verify): Code/config verification. Reads exploration results via `get_investigation`. Verifies against source code and configuration. Saves verdict via `save_investigation` and updates group via `update_group`.
 
 The two-stage split is intentional — it prevents agents from skipping energy exploration and falling back to grep, or from citing graph topology as verification.
 
@@ -143,12 +143,17 @@ Load the graph: `load_graph_energies(branch_id)`.
 
 ## Pipeline Orchestration
 
-The pipeline runs linearly across seven phases, with agents running in **parallel within each phase**.
+The pipeline is **checkpoint-driven** — every phase checks the findings store before running. Completed work is skipped automatically. This means:
 
-Call `triage_get_workflow_args(project_id)` to validate, present configuration for user confirmation.
-Launch `Workflow({ name: "triage-pipeline", args: <validated args> })`.
+- **Crash recovery**: just relaunch. The pipeline reads what's done from SQLite and picks up where it left off.
+- **Rate limit**: wait for reset, relaunch with the same profile_id. Haiku agents (pennies) check each phase, only Opus agents (dollars) run for new work.
+- **Resume**: `Workflow({ name: "triage-pipeline", args: { profile_id: "<project_id>" } })` — that's it. Everything else comes from the project.
 
-The workflow handles phase orchestration, model selection per phase (Opus for discovery/investigation/delivery, Sonnet for grouping/sweep, Haiku for routing), structured output schemas, and parallel agent scheduling within each phase.
+Call `pipeline_status(project_id)` to see phase completion before launching.
+
+Launch: `Workflow({ name: "triage-pipeline", args: { profile_id: "<project_id>" } })`.
+
+The workflow handles phase orchestration, model selection per phase (Opus for discovery/investigation/delivery, Sonnet for grouping/sweep, Haiku for checkpoints/routing), and parallel agent scheduling within each phase.
 
 ## Three Activities
 
@@ -169,7 +174,7 @@ Before running the pipeline:
    Ask: **"These are the settings I'll run with. Anything to change?"** Wait for confirmation.
 5. Launch the pipeline — see Pipeline Orchestration above.
 
-**Resume on failure:** `Workflow({scriptPath: "<path>", resumeFromRunId: "<runId>"})`. Cached agents replay; only failed/new steps re-run.
+**Resume after failure:** Just relaunch with the same profile_id: `Workflow({ name: "triage-pipeline", args: { profile_id: "<project_id>" } })`. The pipeline reads completed work from the findings store and only runs what's missing. No scriptPath or resumeFromRunId needed.
 
 ### 2. Validate a structural lead
 

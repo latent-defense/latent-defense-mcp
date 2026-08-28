@@ -6,6 +6,7 @@ import json
 from typing import Any, Callable
 
 from .energy_cache import EnergyGraphCache
+from . import observation_tools
 
 
 def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None:
@@ -44,6 +45,8 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
         edges = cache.get_connected_edges(node["name"])
         node["outbound_edges"] = sum(1 for e in edges if e.get("direction") == "outbound")
         node["inbound_edges"] = sum(1 for e in edges if e.get("direction") == "inbound")
+        # Track that this node was read — gates edit/delete tools
+        observation_tools.mark_node_read(node["name"])
         return json.dumps(node)
 
     @mcp.tool()
@@ -57,6 +60,8 @@ def register(mcp: Any, get_cache: Callable[[], EnergyGraphCache | None]) -> None
         row = cache.db.execute(f"SELECT {cols} FROM edges WHERE name = ?", (name,)).fetchone()
         if row is None:
             return json.dumps({"error": f"Edge not found: {name}"})
+        # Track that this edge was read — gates edit/delete tools
+        observation_tools.mark_edge_read(row[0])
         return json.dumps(cache._edge_from_row(row))
 
     @mcp.tool()

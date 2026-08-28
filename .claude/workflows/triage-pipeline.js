@@ -3,9 +3,9 @@ export const meta = {
   description: 'Structural triage: recursive grouping → energy-guided investigation → audience delivery',
   phases: [
     { title: 'Load', detail: 'Pre-load graph for energy tools' },
-    { title: 'Discover', detail: 'Parent agent reads all findings, identifies remediation clusters' },
-    { title: 'Group', detail: 'Recursive agents claim findings, energy-guided split/merge' },
-    { title: 'Sweep', detail: 'Catch unclaimed findings via structural proximity' },
+    { title: 'Discover', detail: 'Load findings into store, identify remediation clusters' },
+    { title: 'Group', detail: 'Claim findings per group via MCP tools, energy-guided splits' },
+    { title: 'Sweep', detail: 'Claim unclaimed findings via query tools' },
     { title: 'Investigate', detail: 'Two-stage: energy exploration → code verification per group' },
     { title: 'Route', detail: 'Classify remaining groups' },
     { title: 'Deliver', detail: 'Per-audience outputs' },
@@ -13,9 +13,37 @@ export const meta = {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Args
+// Args — always load from project state, args override
 // ═══════════════════════════════════════════════════════════════
-const parsed = (typeof args === 'string') ? JSON.parse(args) : (args || {})
+let parsed = (typeof args === 'string') ? JSON.parse(args) : (args || {})
+const profileId = parsed.profile_id || ''
+
+if (!profileId) {
+  log('✗ No profile_id provided')
+  return { status: 'error', errors: ['No profile_id — pass at least {profile_id: "..."}'] }
+}
+
+// Always load from project first — args override for one-off changes
+const projectData = await agent(`
+Load the triage project and user profile.
+ToolSearch query="select:mcp__latent-defense__triage_load_project,mcp__latent-defense__triage_load_user" max_results=2
+Call triage_load_project(project_id="${profileId}").
+Also call triage_load_user(name="default") or the first available user.
+Return all project fields: branch_id, sources, audiences, verification_channels, user_context, deployment_model, output_dir.
+`, { label: 'load-project', phase: 'Load', model: 'haiku', schema: {
+  type: 'object', properties: {
+    branch_id: { type: 'string' }, sources: { type: 'array' }, audiences: { type: 'array' },
+    verification_channels: { type: 'array' }, user_context: { type: 'object' },
+    deployment_model: { type: 'string' }, output_dir: { type: 'string' },
+  },
+}})
+
+// Merge: args override project data
+if (projectData) {
+  const merged = { ...projectData, ...parsed, profile_id: profileId }
+  parsed = merged
+}
+
 const sources = parsed.sources || []
 if (parsed.findings_path && sources.length === 0) {
   sources.push({ path: parsed.findings_path, type: 'scanner', name: 'scanner', authority: 'tool' })
@@ -27,7 +55,6 @@ const audiences = parsed.audiences || []
 const maxInvestigate = parsed.max_investigate || 9999
 const maxDepth = parsed.max_group_depth || 3
 const outputDir = parsed.output_dir || 'triage-output'
-const profileId = parsed.profile_id || ''
 
 const errors = []
 if (sources.length === 0) errors.push('No sources')
@@ -38,10 +65,30 @@ if (errors.length > 0) {
   return { status: 'error', errors }
 }
 
-log(`Sources: ${sources.map(s => s.name || s.type).join(', ')}`)
+log(`Profile: ${profileId}`)
+log(`Sources: ${sources.map(s => s.name || s.type || s.path).join(', ')}`)
 log(`Branch: ${branchId}`)
 log(`Audiences: ${audiences.map(a => a.name).join(', ')}`)
-log(`Verification channels: ${verificationChannels.length || 'none'}`)
+
+// ═══════════════════════════════════════════════════════════════
+// Checkpoint: read pipeline status to determine what's already done
+// ═══════════════════════════════════════════════════════════════
+const checkpoint = await agent(`
+ToolSearch query="select:mcp__latent-defense__pipeline_status" max_results=1
+Call pipeline_status(project_id="${profileId}").
+Return the full result.
+`, { label: 'checkpoint', phase: 'Load', model: 'haiku', schema: {
+  type: 'object', properties: {
+    total_findings: { type: 'integer' }, claimed: { type: 'integer' }, unclaimed: { type: 'integer' },
+    groups: { type: 'integer' }, investigated: { type: 'integer' }, explored_only: { type: 'integer' },
+    pending_investigate: { type: 'integer' },
+    phases: { type: 'object' }, next_action: { type: 'string' },
+  },
+}})
+
+const cp = checkpoint || { phases: {} }
+log(`Checkpoint: ${JSON.stringify(cp.phases || {})}`)
+log(`Next action: ${cp.next_action || 'start from beginning'}`)
 
 // ═══════════════════════════════════════════════════════════════
 // Verification channels → agent instructions
@@ -60,6 +107,10 @@ const VERIFY_INSTRUCTIONS = verificationChannels.length > 0
 const ENERGY_TOOLS = `ToolSearch query="select:mcp__latent-defense__energy_node_scores,mcp__latent-defense__energy_lowest_hop,mcp__latent-defense__energy_edge_scores,mcp__latent-defense__energy_trace_to_target" max_results=5`
 
 const GRAPH_TOOLS = `ToolSearch query="select:mcp__latent-defense__read_node,mcp__latent-defense__grep_nodes,mcp__latent-defense__find_nodes_by_type,mcp__latent-defense__get_connected_edges" max_results=5`
+
+const FINDINGS_TOOLS = `ToolSearch query="select:mcp__latent-defense__query_findings,mcp__latent-defense__get_finding,mcp__latent-defense__findings_stats,mcp__latent-defense__claim_findings_by_query,mcp__latent-defense__claim_findings_range,mcp__latent-defense__claim_findings,mcp__latent-defense__create_group,mcp__latent-defense__update_group,mcp__latent-defense__list_groups" max_results=10`
+
+const INVESTIGATE_TOOLS = `ToolSearch query="select:mcp__latent-defense__save_investigation,mcp__latent-defense__get_investigation,mcp__latent-defense__query_findings,mcp__latent-defense__list_groups,mcp__latent-defense__update_group" max_results=6`
 
 const ENERGY_METHOD = `
 ## Energy-guided decisions
@@ -108,10 +159,6 @@ want to reach. Prioritize them in outbound exploration:
 - credential, crypto_key — authentication material
 - service_account, iam_role — privilege escalation
 - environment_var — when it holds secrets (check context)
-A node is high-priority when it is a target type AND has many inbound writes_to,
-authenticates_to, or has_permission edges AND is reachable (low entry energy).
-Nodes with zero outbound edges and many sensitive inbound edges are structural sinks —
-the things the infrastructure is built to protect.
 `
 
 const INVESTIGATION_METHOD = `
@@ -168,6 +215,38 @@ const RESOLUTION_GUIDE = `
 4. Is that failure condition defended?
 `
 
+const GRAPH_CORRECTION_TOOLS = `ToolSearch query="select:mcp__latent-defense__edit_node,mcp__latent-defense__add_node,mcp__latent-defense__add_edge,mcp__latent-defense__delete_node,mcp__latent-defense__delete_edge,mcp__latent-defense__edit_edge,mcp__latent-defense__edit_subgraph,mcp__latent-defense__bulk_edit_edges" max_results=8`
+
+const GRAPH_CORRECTION = `
+## Graph corrections — required, not optional
+
+When your verification reveals the graph is wrong — stale metadata, missing edges, inaccurate
+descriptions — fix it right then. Do not document it for later. Do not flag it for remapping.
+A graph that lies about infrastructure is worse than an incomplete graph.
+
+**How:**
+1. Call read_node(name) or read_edge(name) first (required before editing — the tools enforce this)
+2. Verify against a source of truth (kubectl, az, aws, gh api output you already have)
+3. Fix what's wrong using the appropriate tool:
+   - **Stale metadata**: edit_node(name, metadata={...corrected...}, reason="verified via kubectl: ...")
+     Metadata is deep-merged — nested keys you don't mention are preserved.
+   - **Wrong node type**: edit_node(name, type="correct_type", reason="...")
+   - **Missing node**: add_node(name, type, metadata, semantic_context, reason)
+   - **Missing edge**: add_edge(name, type, source, target, reason)
+   - **Wrong edge endpoint**: edit_edge(name, source=..., target=..., reason)
+   - **Stale metadata keys**: edit_node(name, remove_keys=["old_key", "nested.old"], reason)
+   - **Decommissioned entity**: delete_node(name, reason) or delete_edge(name, reason)
+   - **Restructure a neighborhood**: edit_subgraph(remove_nodes, add_nodes, modify_nodes, ...)
+   - **Fix many edges at once**: bulk_edit_edges(edge_type=..., metadata={...}, dry_run=true first)
+
+Only correct based on grounded evidence — CLI output, source code, API responses you ran
+during this investigation. Never correct based on assumptions.
+
+Do NOT call commit_graph — corrections are committed as a batch after all investigations complete.
+
+${GRAPH_CORRECTION_TOOLS}
+`
+
 const REPORT_METHODOLOGY = `
 ## Report rules
 - Lead with the action table
@@ -181,140 +260,18 @@ const REPORT_METHODOLOGY = `
 `
 
 // ═══════════════════════════════════════════════════════════════
-// Schemas
-// ═══════════════════════════════════════════════════════════════
-
-const CLUSTER_SCHEMA = {
-  type: 'object',
-  properties: {
-    clusters: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          id: { type: 'string' },
-          description: { type: 'string' },
-          estimated_findings: { type: 'integer' },
-          hint: { type: 'string' },
-          canonical_type: { type: 'string' },
-          remediation_class: { type: 'string' },
-        },
-        required: ['id', 'description', 'estimated_findings', 'hint', 'canonical_type'],
-      },
-    },
-    total_findings: { type: 'integer' },
-    rationale: { type: 'string' },
-  },
-  required: ['clusters', 'total_findings'],
-}
-
-const GROUP_SCHEMA = {
-  type: 'object',
-  properties: {
-    group_id: { type: 'string' },
-    is_leaf: { type: 'boolean' },
-    claimed_findings: { type: 'array', items: { type: 'integer' } },
-    children: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          id: { type: 'string' }, description: { type: 'string' },
-          estimated_findings: { type: 'integer' }, hint: { type: 'string' },
-        },
-        required: ['id', 'description', 'estimated_findings', 'hint'],
-      },
-    },
-    cross_refs: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: { finding_idx: { type: 'integer' }, target_group: { type: 'string' }, reason: { type: 'string' } },
-        required: ['finding_idx', 'reason'],
-      },
-    },
-    energy_analysis: {
-      type: 'object',
-      properties: {
-        anchor_nodes: { type: 'array', items: { type: 'object', properties: {
-          finding_idx: { type: 'integer' }, node_id: { type: 'string' }, node_type: { type: 'string' }, entry_energy: { type: 'number' },
-        }}},
-        entry_energy_min: { type: 'number' }, entry_energy_max: { type: 'number' },
-        entry_energy_spread: { type: 'number' },
-        split_reason: { type: 'string' },
-        structural_zone: { type: 'string' },
-      },
-    },
-    annotation: {
-      type: 'object',
-      properties: {
-        canonical_type: { type: 'string' }, remediation_class: { type: 'string' },
-        affected_services: { type: 'array', items: { type: 'string' } },
-        graph_search_hints: { type: 'array', items: { type: 'string' } },
-        title: { type: 'string' }, severity_summary: { type: 'string' },
-      },
-      required: ['canonical_type', 'title'],
-    },
-    warnings: { type: 'array', items: { type: 'string' } },
-  },
-  required: ['group_id', 'is_leaf', 'claimed_findings', 'annotation'],
-}
-
-const INVESTIGATE_EXPLORE_SCHEMA = {
-  type: 'object', properties: {
-    id: { type: 'string' },
-    structural_position: { type: 'string' },
-    entry_energy: { type: 'number' },
-    controls_found: { type: 'array', items: { type: 'object', properties: {
-      node: { type: 'string' }, type: { type: 'string' }, braking: { type: 'boolean' }, energy: { type: 'number' },
-    }}},
-    paths_from_entry: { type: 'array', items: { type: 'object', properties: {
-      entry: { type: 'string' }, momentum: { type: 'number' }, hops: { type: 'integer' },
-    }}},
-    sensitive_reachable: { type: 'array', items: { type: 'string' } },
-    blast_radius_structural: { type: 'string' },
-    files_to_verify: { type: 'array', items: { type: 'string' } },
-    key_questions: { type: 'array', items: { type: 'string' } },
-  }, required: ['id', 'structural_position', 'files_to_verify', 'key_questions'],
-}
-
-const INVESTIGATE_VERIFY_SCHEMA = {
-  type: 'object', properties: {
-    id: { type: 'string' },
-    resolution: { type: 'string', enum: ['eliminable', 'reducible', 'constrained', 'drift_prone', 'mitigated'] },
-    readiness: { type: 'string', enum: ['remediation_ready', 'investigation_needed'] },
-    verdict: { type: 'string', enum: ['confirmed', 'refuted', 'partial'] },
-    evidence: { type: 'string' },
-    evidence_source: { type: 'string', enum: ['source_code', 'config_file', 'runtime_test', 'graph_context', 'semantic_context'] },
-    unresolved: { type: 'array', items: { type: 'string' } },
-    action: { type: 'string' },
-    blast_radius: { type: 'string' },
-    primary_audience: { type: 'string' },
-    control_chain: { type: 'array', items: { type: 'object', properties: {
-      question: { type: 'string' }, answer: { type: 'string' },
-      status: { type: 'string', enum: ['verified', 'gap', 'unresolved'] },
-    }}},
-    key_insight: { type: 'string' },
-  }, required: ['id', 'resolution', 'readiness', 'verdict', 'action'],
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Phase 1: Load graph
+// Phase 1: Load graph (always runs — graph must be in cache)
 // ═══════════════════════════════════════════════════════════════
 phase('Load')
-log('Loading graph (triggers JEPA encoding with progress)...')
+log('Loading graph into local cache...')
 const loadResult = await agent(`
-Load the infrastructure graph for energy analysis. This is a two-step process:
+Load the infrastructure graph for energy analysis.
 
-Step 1: Warm the inference cache and wait for encoding.
-ToolSearch query="select:mcp__latent-defense__load_branch,mcp__latent-defense__wait_for_load" max_results=2
-Call load_branch("${branchId}").
-Then call wait_for_load(timeout_secs=600, poll_interval=15) to block until encoding completes.
-
-Step 2: Load the energy scores into the local cache.
 ToolSearch query="select:mcp__latent-defense__load_graph_energies" max_results=1
 Call load_graph_energies("${branchId}").
-This fetches the pre-computed energy scores (instant after encoding completes).
+
+This checks the local disk cache first (instant if already cached from a previous session).
+Only fetches from the remote server if no cache exists.
 
 Report the node count, edge count, and whether energies loaded (has_energies).
 `, { label: 'load-graph', phase: 'Load', model: 'sonnet', schema: {
@@ -322,215 +279,317 @@ Report the node count, edge count, and whether energies loaded (has_energies).
 }})
 log(`Graph: ${loadResult?.n_nodes || '?'} nodes, ${loadResult?.n_edges || '?'} edges, energies: ${loadResult?.has_energies}`)
 
+if (!loadResult || loadResult.status === 'error' || !loadResult.n_nodes) {
+  return { status: 'error', reason: 'Graph failed to load. Check authentication and branch_id.', loadResult }
+}
+
 // ═══════════════════════════════════════════════════════════════
-// Phase 2: Discover clusters
+// Phase 2: Discover — skip if groups already exist
 // ═══════════════════════════════════════════════════════════════
 phase('Discover')
-log('Reading all findings...')
 
-const allSourcePaths = sources.map(s => s.path)
-const discoverResult = await agent(`
-Read ALL findings and produce high-level clusters grouped by REMEDIATION ACTION.
+let totalFindings = cp.total_findings || 0
 
-Sources: ${allSourcePaths.map(p => `\n- ${p}`).join('')}
-${uc.data_assessment ? `\nUser assessment: ${uc.data_assessment}` : ''}
+if (cp.phases?.discover === 'complete') {
+  log(`Discover: SKIPPING — ${cp.groups} groups already exist, ${cp.claimed}/${cp.total_findings} claimed`)
+  totalFindings = cp.total_findings
+} else {
+  log('Loading findings into store and discovering clusters...')
+  const allSourcePaths = sources.map(s => s.path)
+  const discoverResult = await agent(`
+You are the discovery agent. Your job:
+
+1. Load ALL findings into the findings store.
+2. Review the distribution and create remediation groups.
+
+## Step 1: Load findings
+${FINDINGS_TOOLS}
+
+${allSourcePaths.map(p => `Call load_findings(project_id="${profileId}", path="${p}")`).join('\n')}
+
+Then call findings_stats(project_id="${profileId}") to see the distribution.
+
+## Step 2: Create remediation groups
+
+${uc.data_assessment ? `User assessment: ${uc.data_assessment}` : ''}
 
 Ask: "if I were fixing these, what batches of work would I create?"
-
-Target 8-20 clusters. Do NOT create per-finding, per-service, or per-scanner clusters.
+Target 8-20 groups. Do NOT create per-finding, per-service, or per-scanner groups.
 
 Common patterns: package CVEs per image, missing auth across services, CI/CD supply chain,
 attack paths per entry point, code defects per class, Dockerfile hygiene, default credentials.
-`, { label: 'discover', phase: 'Discover', model: 'opus', schema: CLUSTER_SCHEMA })
 
-if (!discoverResult?.clusters) return { status: 'error', reason: 'Discover failed' }
+For each group, call:
+  create_group(project_id="${profileId}", group_id=<short-id>, description=<remediation action>)
 
-log(`Discovered ${discoverResult.clusters.length} clusters from ${discoverResult.total_findings} findings`)
-for (const c of discoverResult.clusters) log(`  ${c.id}: ~${c.estimated_findings} — ${c.description.slice(0, 80)}`)
+## Important: Do NOT claim findings
+
+Your job is ONLY to create groups. Do NOT call claim_findings_by_query, claim_findings_range, or claim_findings.
+Claiming is done by the Group agents in the next phase — they search for and claim findings
+that match their group's description.
+
+After creating groups, call findings_stats to report the distribution.
+Then call list_groups to report all groups.
+
+Return the total findings count and group count.
+`, { label: 'discover', phase: 'Discover', model: 'opus', schema: {
+    type: 'object', properties: {
+      total_findings: { type: 'integer' },
+      groups_created: { type: 'integer' },
+    }, required: ['total_findings', 'groups_created'],
+  }})
+
+  if (!discoverResult) return { status: 'error', reason: 'Discover failed' }
+  totalFindings = discoverResult.total_findings || 0
+  log(`Discovered: ${totalFindings} findings → ${discoverResult.groups_created} groups`)
+}
 
 // ═══════════════════════════════════════════════════════════════
-// Phase 3: Recursive grouping with energy guidance
+// Phase 3: Group — skip if all findings claimed
 // ═══════════════════════════════════════════════════════════════
 phase('Group')
 
-// NOTE: allGroups and allCrossRefs are populated inside parallel() callbacks.
-// Completion order is non-deterministic (LLM latency on first run, instant cache
-// on resume). To make downstream prompts cache-stable across resumes:
-// 1. Store RAW claimed_findings from agents (no filtering during parallel)
-// 2. After parallel completes, sort by group_id (deterministic)
-// 3. Deduplicate claims with deterministic tie-breaking (alphabetical group_id wins)
-const allGroupsRaw = []
-const allCrossRefsRaw = []
+if (cp.phases?.group === 'complete') {
+  log(`Group: SKIPPING — all ${cp.claimed} findings already claimed`)
+} else {
+  // Read groups — only process those with 0 claims
+  const groupListResult = await agent(`
+You have ONE job: call the list_groups MCP tool and return the result.
 
-async function refineCluster(cluster, depthRemaining, parentPath) {
-  const clusterId = `${parentPath}/${cluster.id}`
-  const result = await agent(`
-Grouping agent for: "${cluster.description}"
+Step 1: Load the tool schema.
+ToolSearch query="select:mcp__latent-defense__list_groups" max_results=1
 
-## Tools
-${ENERGY_TOOLS}
-${GRAPH_TOOLS}
-${ENERGY_METHOD}
+Step 2: Call the tool.
+mcp__latent-defense__list_groups(project_id="${profileId}")
 
-1. Read findings from: ${allSourcePaths.join(', ')}
-2. Find ALL findings belonging to this cluster
-3. Call energy_node_scores for each finding's subject to get entry energies
-4. Based on energy spread: CLAIM (is_leaf=true) or SPLIT (is_leaf=false)
+Step 3: Return the groups array from the result.
 
-Hint: "${cluster.hint}"
-Type: "${cluster.canonical_type}"
-${cluster.remediation_class ? `Fix: "${cluster.remediation_class}"` : ''}
-${depthRemaining <= 1 ? 'MUST terminate (is_leaf=true).' : `Depth remaining: ${depthRemaining}`}
-
-List EXACT 0-based indices in claimed_findings. Report cross_refs for other clusters' findings.
-`, { label: `group-${cluster.id}`, phase: 'Group', model: 'sonnet', schema: GROUP_SCHEMA })
-
-  if (!result) { log(`  Warning: ${clusterId} null`); return }
-
-  // Store RAW claims — deduplication happens after parallel() completes
-  const rawClaims = result.claimed_findings || []
-  if (result.cross_refs) {
-    for (const cr of result.cross_refs) allCrossRefsRaw.push({ ...cr, source_group: clusterId })
-  }
-
-  if (result.energy_analysis) {
-    const ea = result.energy_analysis
-    log(`  Energy: spread=${ea.entry_energy_spread?.toFixed(1) || '?'} zone=${ea.structural_zone || '?'}`)
-  }
-
-  if (result.is_leaf || depthRemaining <= 1) {
-    allGroupsRaw.push({ ...result, group_id: clusterId, claimed_findings: rawClaims, depth: maxDepth - depthRemaining })
-    log(`  Leaf: ${clusterId} claimed ${rawClaims.length}`)
-  } else if (result.children?.length > 0) {
-    log(`  Split: ${clusterId} → ${result.children.length} children`)
-    if (rawClaims.length > 0) {
-      allGroupsRaw.push({ ...result, group_id: `${clusterId}/claimed`, is_leaf: true, claimed_findings: rawClaims, children: [], depth: maxDepth - depthRemaining })
-    }
-    await parallel(result.children.map(child => () => refineCluster(child, depthRemaining - 1, clusterId)))
-  } else {
-    log(`  Warning: ${clusterId} is_leaf=false but no children, forcing leaf`)
-    allGroupsRaw.push({ ...result, group_id: clusterId, is_leaf: true, claimed_findings: rawClaims, depth: maxDepth - depthRemaining })
-  }
-}
-
-await parallel(discoverResult.clusters.map(cluster => () => refineCluster(cluster, maxDepth, '')))
-
-// ── Deterministic post-processing ──
-// Sort groups and cross-refs by group_id so downstream prompts are stable across resumes.
-allGroupsRaw.sort((a, b) => a.group_id.localeCompare(b.group_id))
-allCrossRefsRaw.sort((a, b) => `${a.source_group}:${a.finding_idx}`.localeCompare(`${b.source_group}:${b.finding_idx}`))
-
-// Deduplicate claims: when multiple groups claim the same finding, the group with
-// the lexicographically first group_id wins. This is deterministic regardless of
-// parallel completion order.
-const claimedGlobal = new Set()
-const allGroups = []
-for (const group of allGroupsRaw) {
-  const dedupedClaims = group.claimed_findings.filter(idx => !claimedGlobal.has(idx))
-  const doubles = group.claimed_findings.length - dedupedClaims.length
-  if (doubles > 0) log(`  Warning: ${group.group_id} double-claimed ${doubles} (resolved by group_id priority)`)
-  for (const idx of dedupedClaims) claimedGlobal.add(idx)
-  allGroups.push({ ...group, claimed_findings: dedupedClaims })
-}
-const allCrossRefs = allCrossRefsRaw
-
-log(`Grouping: ${allGroups.length} leaf groups, ${claimedGlobal.size} claimed`)
-
-// ═══════════════════════════════════════════════════════════════
-// Phase 4: Sweep unclaimed
-// ═══════════════════════════════════════════════════════════════
-phase('Sweep')
-const totalFindings = discoverResult.total_findings
-const unclaimed = []
-for (let i = 0; i < totalFindings; i++) { if (!claimedGlobal.has(i)) unclaimed.push(i) }
-log(`Unclaimed: ${unclaimed.length}/${totalFindings}`)
-
-if (unclaimed.length > 0) {
-  const groupAnchors = allGroups
-    .filter(g => g.energy_analysis?.anchor_nodes?.length > 0)
-    .map(g => ({ group_id: g.group_id, title: g.annotation?.title, anchor: g.energy_analysis.anchor_nodes[0]?.node_id, zone: g.energy_analysis.structural_zone }))
-
-  const sweepResult = await agent(`
-Sweep: assign unclaimed findings [${unclaimed.join(', ')}]
-
-## Tools
-${ENERGY_TOOLS}
-${GRAPH_TOOLS}
-${ENERGY_METHOD}
-
-Read findings from: ${allSourcePaths.join(', ')}
-
-Existing groups:
-${allGroups.map(g => `- ${g.group_id}: ${g.annotation?.title || 'untitled'} (${g.claimed_findings?.length || 0} findings)`).join('\n')}
-
-${groupAnchors.length > 0 ? `Anchored groups:\n${groupAnchors.map(g => `- ${g.group_id}: anchor=${g.anchor}, zone=${g.zone}`).join('\n')}` : ''}
-
-${allCrossRefs.length > 0 ? `Cross-refs:\n${allCrossRefs.slice(0, 20).map(cr => `Finding ${cr.finding_idx} → "${cr.target_group}" (${cr.reason})`).join('\n')}` : ''}
-`, { label: 'sweep', phase: 'Sweep', model: 'sonnet', schema: {
+Do NOT write Python scripts. Do NOT use Bash. Just call the MCP tool directly.
+`, { label: 'list-groups', phase: 'Group', model: 'sonnet', schema: {
     type: 'object', properties: {
-      assignments: { type: 'array', items: { type: 'object', properties: { finding_idx: { type: 'integer' }, group_id: { type: 'string' }, reason: { type: 'string' } }, required: ['finding_idx', 'group_id'] } },
-      new_groups: { type: 'array', items: GROUP_SCHEMA },
-    }, required: ['assignments'],
+      groups: { type: 'array', items: { type: 'object', properties: {
+        group_id: { type: 'string' }, description: { type: 'string' }, finding_count: { type: 'integer' },
+      }}},
+    }, required: ['groups'],
   }})
 
-  if (sweepResult) {
-    for (const a of (sweepResult.assignments || [])) {
-      claimedGlobal.add(a.finding_idx)
-      const existing = allGroups.find(g => g.group_id === a.group_id)
-      if (existing) { existing.claimed_findings = existing.claimed_findings || []; existing.claimed_findings.push(a.finding_idx) }
-    }
-    for (const ng of (sweepResult.new_groups || [])) {
-      allGroups.push({ ...ng, depth: 0 })
-      for (const idx of (ng.claimed_findings || [])) claimedGlobal.add(idx)
-    }
+  const groups = groupListResult?.groups || []
+  // Only process groups that need claims (finding_count === 0 or undefined)
+  const needsClaiming = groups.filter(g => !g.finding_count || g.finding_count === 0)
+  const alreadyClaimed = groups.length - needsClaiming.length
+
+  if (needsClaiming.length === 0 && alreadyClaimed > 0) {
+    log(`Group: SKIPPING — all ${groups.length} groups already have claims`)
+  } else {
+    const toProcess = needsClaiming.length > 0 ? needsClaiming : groups
+    log(`Claiming for ${toProcess.length} groups (${alreadyClaimed} already have claims)...`)
+
+    await parallel(toProcess.map(group => () => agent(`
+Refine group "${group.group_id}" (${group.finding_count || '?'} findings): ${group.description}
+
+## Setup — load graph first
+ToolSearch query="select:mcp__latent-defense__load_graph_energies" max_results=1
+Call load_graph_energies("${branchId}") — returns instantly from disk cache.
+
+## Tools
+${FINDINGS_TOOLS}
+${ENERGY_TOOLS}
+${GRAPH_TOOLS}
+${ENERGY_METHOD}
+
+## Your task — claim findings that belong to this group
+
+1. Search for findings matching this group's description:
+   claim_findings_by_query(project_id="${profileId}", group_id="${group.group_id}", keyword=<relevant terms>, dry_run=true)
+   Also try: scanner=..., severity=..., repo=..., category=...
+   Review the dry_run preview carefully. If the matches look correct:
+   claim_findings_by_query(project_id="${profileId}", group_id="${group.group_id}", ..., dry_run=false)
+
+   For large contiguous scanner blocks (e.g., all Trivy findings for one image):
+   claim_findings_range(project_id="${profileId}", group_id="${group.group_id}", start=..., end=..., dry_run=true)
+   Review. Then: dry_run=false
+
+   Iterate with different queries until you've captured all findings for this group.
+
+2. Review what you claimed:
+   query_findings(project_id="${profileId}", group_id="${group.group_id}", limit=20)
+   Read a sample with get_finding for details. Unclaim anything that doesn't belong.
+
+3. Energy analysis: find anchor nodes with grep_nodes, then energy_node_scores.
+   If entry energy spread > 2.0, consider splitting — but splitting creates complexity,
+   so only split if the findings genuinely need different remediation approaches.
+   Update the group anchor: update_group(project_id="${profileId}", group_id="${group.group_id}", anchor_node=<node>)
+
+Report what you claimed and the energy analysis.
+`, { label: `refine-${group.group_id}`, phase: 'Group', model: 'sonnet' })))
   }
 }
 
-// Accounting check
-const finalUnclaimed = []
-for (let i = 0; i < totalFindings; i++) { if (!claimedGlobal.has(i)) finalUnclaimed.push(i) }
-const claimCounts = {}
-for (const g of allGroups) for (const idx of (g.claimed_findings || [])) claimCounts[idx] = (claimCounts[idx] || 0) + 1
-const doubleClaimed = Object.entries(claimCounts).filter(([_, c]) => c > 1)
-log(`After sweep: ${claimedGlobal.size}/${totalFindings} claimed, ${finalUnclaimed.length} unclaimed, ${doubleClaimed.length} double`)
+// ═══════════════════════════════════════════════════════════════
+// Phase 4: Sweep — skip if all findings claimed
+// ═══════════════════════════════════════════════════════════════
+phase('Sweep')
+
+// Re-check claim status after Group phase
+const postGroupCheck = await agent(`
+You have ONE job: call the findings_stats MCP tool and return the counts.
+
+Step 1: Load the tool schema.
+ToolSearch query="select:mcp__latent-defense__findings_stats" max_results=1
+
+Step 2: Call the tool.
+mcp__latent-defense__findings_stats(project_id="${profileId}")
+
+Step 3: Return total, claimed, unclaimed counts from the result.
+
+Do NOT write Python scripts. Do NOT use Bash. Just call the MCP tool directly.
+`, { label: 'check-sweep', phase: 'Sweep', model: 'sonnet', schema: {
+  type: 'object', properties: {
+    total: { type: 'integer' }, claimed: { type: 'integer' }, unclaimed: { type: 'integer' },
+  },
+}})
+
+if (postGroupCheck?.unclaimed === 0) {
+  log(`Sweep: SKIPPING — all ${postGroupCheck?.claimed} findings claimed`)
+} else {
+  log(`Sweeping ${postGroupCheck?.unclaimed || '?'} unclaimed findings...`)
+  await agent(`
+Sweep: find and assign all unclaimed findings.
+
+## Setup — load graph
+ToolSearch query="select:mcp__latent-defense__load_graph_energies" max_results=1
+Call load_graph_energies("${branchId}") — returns instantly from disk cache.
+
+## Tools
+${FINDINGS_TOOLS}
+${ENERGY_TOOLS}
+${GRAPH_TOOLS}
+${ENERGY_METHOD}
+
+1. Call findings_stats(project_id="${profileId}") to check how many are unclaimed.
+2. If unclaimed > 0, call query_findings(project_id="${profileId}", unclaimed_only=true, limit=100)
+3. For each unclaimed finding:
+   - Read it with get_finding
+   - Find the best matching group using keyword matching against list_groups descriptions
+   - Or use grep_nodes + energy_node_scores + energy_trace_to_target to find the structurally closest group
+   - Claim it: claim_findings(project_id="${profileId}", group_id=<best_match>, indices="<idx>")
+4. If a finding doesn't fit any group, create a new one with create_group, then claim.
+5. Repeat until findings_stats shows 0 unclaimed.
+
+Report final stats.
+`, { label: 'sweep', phase: 'Sweep', model: 'sonnet' })
+}
+
+// Hard check: do NOT proceed with unclaimed findings.
+// Re-read stats to verify — the previous checks may be stale.
+const preSweepVerify = await agent(`
+You have ONE job: call findings_stats and return the unclaimed count.
+
+ToolSearch query="select:mcp__latent-defense__findings_stats" max_results=1
+mcp__latent-defense__findings_stats(project_id="${profileId}")
+
+Return the unclaimed count.
+Do NOT write Python scripts. Do NOT use Bash.
+`, { label: 'verify-sweep', phase: 'Sweep', model: 'sonnet', schema: {
+  type: 'object', properties: { unclaimed: { type: 'integer' }, total: { type: 'integer' }, claimed: { type: 'integer' } },
+}})
+
+if (preSweepVerify?.unclaimed > 0) {
+  log(`⚠ ${preSweepVerify.unclaimed} findings still unclaimed after Sweep — proceeding but flagging`)
+}
 
 // ═══════════════════════════════════════════════════════════════
-// Phase 5: Investigate (two-stage pipeline)
+// Phase 5: Investigate — only pending groups
 // ═══════════════════════════════════════════════════════════════
 phase('Investigate')
 
-const toInvestigate = allGroups.slice(0, maxInvestigate)
-log(`Investigating ${toInvestigate.length} groups...`)
+// Get groups that still need investigation
+const investigateCheck = await agent(`
+You must determine which groups need investigation. Follow these steps exactly:
 
-const investigated = await pipeline(
-  toInvestigate,
+Step 1: Load the tool schemas.
+ToolSearch query="select:mcp__latent-defense__list_groups,mcp__latent-defense__get_investigation" max_results=2
 
-  // Stage 1: Energy exploration
-  (group) => agent(`
-Explore the structural position of this finding group using energy tools.
+Step 2: Get all groups.
+mcp__latent-defense__list_groups(project_id="${profileId}")
+
+Step 3: For EACH group returned, check if it has an investigation.
+mcp__latent-defense__get_investigation(project_id="${profileId}", group_id=<the group's ID>)
+
+Step 4: Categorize each group:
+- If get_investigation returns "No investigation found" → needs both explore and verify → add to groups_needing_explore
+- If get_investigation returns explore_result but NO verdict → needs only verify → add to groups_needing_verify
+- If get_investigation returns a verdict → already done
+
+Do NOT write Python scripts. Do NOT use Bash. Call MCP tools directly.
+`, { label: 'check-investigate', phase: 'Investigate', model: 'sonnet', schema: {
+  type: 'object', properties: {
+    groups_needing_explore: { type: 'array', items: { type: 'object', properties: {
+      group_id: { type: 'string' }, description: { type: 'string' },
+      finding_count: { type: 'integer' }, anchor_node: { type: 'string' },
+    }}},
+    groups_needing_verify: { type: 'array', items: { type: 'object', properties: {
+      group_id: { type: 'string' }, description: { type: 'string' },
+      finding_count: { type: 'integer' }, anchor_node: { type: 'string' },
+    }}},
+    already_done: { type: 'integer' },
+  },
+}})
+
+const needsExplore = (investigateCheck?.groups_needing_explore || []).slice(0, maxInvestigate)
+const needsVerify = investigateCheck?.groups_needing_verify || []
+const alreadyInvestigated = investigateCheck?.already_done || 0
+
+log(`Investigate: ${alreadyInvestigated} done, ${needsExplore.length} need explore+verify, ${needsVerify.length} need verify only`)
+
+// Run explore → verify pipeline for groups that need both stages
+let explored = []
+if (needsExplore.length > 0) {
+  explored = await pipeline(
+    needsExplore,
+
+    // Stage 1: Energy exploration
+    (group) => agent(`
+Explore the structural position of finding group "${group.group_id}": ${group.description}
+
+## Setup — load graph
+ToolSearch query="select:mcp__latent-defense__load_graph_energies" max_results=1
+Call load_graph_energies("${branchId}") — returns instantly from disk cache.
 
 ${ENERGY_GUIDE}
 ${ENERGY_TOOLS}
 ${GRAPH_TOOLS}
+${INVESTIGATE_TOOLS}
 
-Starting point:
-${group.energy_analysis?.anchor_nodes?.length > 0 ? `Anchors: ${JSON.stringify(group.energy_analysis.anchor_nodes.slice(0, 3))}` : `Search hints: ${JSON.stringify(group.annotation?.graph_search_hints?.slice(0, 5) || [])}`}
+1. Load the group's findings: query_findings(project_id="${profileId}", group_id="${group.group_id}")
+2. Find anchor nodes: grep_nodes for the affected services/resources
+3. Energy analysis: energy_node_scores, energy_lowest_hop, energy_trace_to_target
+
+${group.anchor_node ? `Start with anchor: ${group.anchor_node}` : 'Find anchor nodes via grep_nodes.'}
 
 Explore iteratively until you can answer: where does this sit structurally,
 what controls exist, what's reachable, what should the code verifier check?
 
-## Group
-${JSON.stringify({ id: group.group_id, title: group.annotation?.title, type: group.annotation?.canonical_type, findings: group.claimed_findings?.length, services: group.annotation?.affected_services }, null, 2)}
-`, { label: `explore-${group.group_id.split('/').pop()}`, phase: 'Investigate', model: 'opus', schema: INVESTIGATE_EXPLORE_SCHEMA }),
+Mark the group as investigating: update_group(project_id="${profileId}", group_id="${group.group_id}", status="investigating")
+Save your exploration: save_investigation(project_id="${profileId}", group_id="${group.group_id}", explore_result=<JSON of your findings>)
 
-  // Stage 2: Code verification
-  (energyResult, group) => agent(`
-Verify this finding group against code and configuration.
+Return: structural position, files to verify, key questions.
+`, { label: `explore-${group.group_id}`, phase: 'Investigate', model: 'opus', schema: {
+      type: 'object', properties: {
+        id: { type: 'string' }, structural_position: { type: 'string' },
+        files_to_verify: { type: 'array', items: { type: 'string' } },
+        key_questions: { type: 'array', items: { type: 'string' } },
+      }, required: ['id', 'structural_position', 'files_to_verify', 'key_questions'],
+    }}),
 
-## Energy exploration results
+    // Stage 2: Code verification
+    (energyResult, group) => agent(`
+Verify finding group "${group.group_id}" against code and configuration.
+
+## Energy exploration results (from the previous stage)
 ${JSON.stringify(energyResult, null, 2)}
 
-Files to verify: ${energyResult?.files_to_verify?.map(f => `\n- ${f}`).join('') || 'Use search hints from the group.'}
+Files to verify: ${energyResult?.files_to_verify?.map(f => `\n- ${f}`).join('') || 'Use search hints.'}
 Key questions: ${energyResult?.key_questions?.map(q => `\n- ${q}`).join('') || 'Determine if structural signals reflect real risk.'}
 
 ## Verification channels
@@ -539,69 +598,154 @@ ${VERIFY_INSTRUCTIONS}
 ${RESOLUTION_GUIDE}
 ${uc.investigation_focus ? `User priorities: ${uc.investigation_focus}` : ''}
 
-## Group
-${JSON.stringify({ id: group.group_id, title: group.annotation?.title, findings: group.claimed_findings?.length, services: group.annotation?.affected_services, severity: group.annotation?.severity_summary }, null, 2)}
-`, { label: `verify-${group.group_id.split('/').pop()}`, phase: 'Investigate', model: 'opus', schema: INVESTIGATE_VERIFY_SCHEMA })
-)
+## Setup — load graph
+ToolSearch query="select:mcp__latent-defense__load_graph_energies" max_results=1
+Call load_graph_energies("${branchId}") — returns instantly from disk cache.
 
-const verified = investigated.filter(Boolean)
-log(`Verified: ${verified.length}/${toInvestigate.length}`)
+## Group context
+${INVESTIGATE_TOOLS}
+Load findings: query_findings(project_id="${profileId}", group_id="${group.group_id}")
 
-// ═══════════════════════════════════════════════════════════════
-// Phase 6: Route remaining
-// ═══════════════════════════════════════════════════════════════
-phase('Route')
-const remaining = allGroups.slice(maxInvestigate)
-let bulkRouted = []
-if (remaining.length > 0) {
-  log(`Bulk-routing ${remaining.length} remaining...`)
-  const bulkResult = await agent(`
-Classify these finding groups.
+${GRAPH_CORRECTION}
 
-${RESOLUTION_GUIDE}
+## Save verdict
+save_investigation(project_id="${profileId}", group_id="${group.group_id}", verdict=<confirmed|refuted|partial>, evidence=<citation>)
+update_group(project_id="${profileId}", group_id="${group.group_id}", resolution=<category>, action=<what to fix>, status="investigated", primary_audience=<who>)
 
-## Groups (${remaining.length})
-${JSON.stringify(remaining.slice(0, 50).map(g => ({ id: g.group_id, title: g.annotation?.title, type: g.annotation?.canonical_type, findings: g.claimed_findings?.length, severity: g.annotation?.severity_summary })), null, 2)}
-`, { label: 'bulk-route', phase: 'Route', model: 'haiku', schema: {
-    type: 'object', properties: {
-      routed: { type: 'array', items: { type: 'object', properties: {
-        id: { type: 'string' }, resolution: { type: 'string', enum: ['eliminable', 'reducible', 'constrained', 'drift_prone', 'mitigated'] },
-        action: { type: 'string' }, primary_audience: { type: 'string' },
-      }, required: ['id', 'resolution', 'action'] }},
-    }, required: ['routed'],
-  }})
-  bulkRouted = bulkResult?.routed || []
+Return verdict and action.
+`, { label: `verify-${group.group_id}`, phase: 'Investigate', model: 'opus', schema: {
+      type: 'object', properties: {
+        id: { type: 'string' },
+        resolution: { type: 'string', enum: ['eliminable', 'reducible', 'constrained', 'drift_prone', 'mitigated'] },
+        verdict: { type: 'string', enum: ['confirmed', 'refuted', 'partial'] },
+        action: { type: 'string' },
+        primary_audience: { type: 'string' },
+      }, required: ['id', 'resolution', 'verdict', 'action'],
+    }})
+  )
 }
 
-const allResolutions = [...verified, ...bulkRouted]
-const resDist = {}
-for (const r of allResolutions) resDist[r.resolution] = (resDist[r.resolution] || 0) + 1
-log(`Resolutions: ${JSON.stringify(resDist)}`)
+// Run verify-only for groups that had explore but no verdict
+let verifiedFromPartial = []
+if (needsVerify.length > 0) {
+  log(`Running verify-only for ${needsVerify.length} groups with existing explore results...`)
+  verifiedFromPartial = await parallel(needsVerify.map(group => () => agent(`
+Verify finding group "${group.group_id}" against code and configuration.
 
-// Save to project
+## Energy exploration results
+This group already has explore results saved. Load them:
+${INVESTIGATE_TOOLS}
+Call get_investigation(project_id="${profileId}", group_id="${group.group_id}") to get the explore_result.
+Use the structural_position, files_to_verify, and key_questions from there.
+
+## Verification channels
+${VERIFY_INSTRUCTIONS}
+
+${RESOLUTION_GUIDE}
+${uc.investigation_focus ? `User priorities: ${uc.investigation_focus}` : ''}
+
+## Setup — load graph
+ToolSearch query="select:mcp__latent-defense__load_graph_energies" max_results=1
+Call load_graph_energies("${branchId}") — returns instantly from disk cache.
+
+## Group context
+Load findings: query_findings(project_id="${profileId}", group_id="${group.group_id}")
+
+${GRAPH_CORRECTION}
+
+## Save verdict
+save_investigation(project_id="${profileId}", group_id="${group.group_id}", verdict=<confirmed|refuted|partial>, evidence=<citation>)
+update_group(project_id="${profileId}", group_id="${group.group_id}", resolution=<category>, action=<what to fix>, status="investigated", primary_audience=<who>)
+
+Return verdict and action.
+`, { label: `verify-${group.group_id}`, phase: 'Investigate', model: 'opus', schema: {
+    type: 'object', properties: {
+      id: { type: 'string' },
+      resolution: { type: 'string', enum: ['eliminable', 'reducible', 'constrained', 'drift_prone', 'mitigated'] },
+      verdict: { type: 'string', enum: ['confirmed', 'refuted', 'partial'] },
+      action: { type: 'string' },
+      primary_audience: { type: 'string' },
+    }, required: ['id', 'resolution', 'verdict', 'action'],
+  }})))
+}
+
+const allVerified = [...explored.filter(Boolean), ...verifiedFromPartial.filter(Boolean)]
+log(`Verified: ${allVerified.length} (${alreadyInvestigated} previously done)`)
+
+// Commit graph corrections accumulated during investigation
+if (needsExplore.length > 0 || needsVerify.length > 0) {
+  log('Committing graph corrections from investigation phase...')
+  await agent(`
+Commit any pending graph corrections from the investigation phase.
+
+ToolSearch query="select:mcp__latent-defense__pending_changes,mcp__latent-defense__commit_graph" max_results=2
+
+Call pending_changes(). If there are changes, review them briefly and call
+commit_graph(message="triage investigation: graph corrections from ${profileId || 'pipeline run'}").
+If no changes, report that the graph required no corrections.
+`, { label: 'commit-corrections', phase: 'Investigate', model: 'sonnet' })
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 6: Route remaining — skip if all groups are routed/investigated
+// ═══════════════════════════════════════════════════════════════
+phase('Route')
+
+// Check for groups that need routing (uninvestigated groups beyond the limit)
+const routeCheck = await agent(`
+You have ONE job: find groups with status "open" that need routing.
+
+Step 1: Load the tool schema.
+ToolSearch query="select:mcp__latent-defense__list_groups" max_results=1
+
+Step 2: Call the tool.
+mcp__latent-defense__list_groups(project_id="${profileId}", status="open")
+
+Step 3: Return the groups array and count.
+
+Do NOT write Python scripts. Do NOT use Bash. Just call the MCP tool directly.
+`, { label: 'check-route', phase: 'Route', model: 'sonnet', schema: {
+  type: 'object', properties: {
+    groups: { type: 'array', items: { type: 'object' } },
+    count: { type: 'integer' },
+  },
+}})
+
+const toRoute = routeCheck?.groups || []
+if (toRoute.length > 0) {
+  log(`Routing ${toRoute.length} remaining groups...`)
+  await agent(`
+Classify these uninvestigated finding groups.
+
+${RESOLUTION_GUIDE}
+${INVESTIGATE_TOOLS}
+
+For each group, call:
+  update_group(project_id="${profileId}", group_id=<id>, resolution=<category>, action=<brief>, status="routed", primary_audience=<who>)
+
+## Groups (${toRoute.length})
+${JSON.stringify(toRoute.map(g => ({ id: g.group_id, description: g.description, findings: g.finding_count })), null, 2)}
+`, { label: 'bulk-route', phase: 'Route', model: 'haiku' })
+} else {
+  log('Route: SKIPPING — all groups investigated or routed')
+}
+
+// Save results to project
 if (profileId) {
   await agent(`
 Save results to project.
-ToolSearch query="select:mcp__latent-defense__triage_save_project" max_results=2
-Call triage_save_project("${profileId}", ${JSON.stringify({
-    results: { total_findings: totalFindings, groups: allGroups.length, investigated: verified.length, resolutions: resDist },
-    finding_groups: allResolutions.map(r => ({ id: r.id, resolution: r.resolution, action: r.action, evidence: r.evidence, status: 'pending', primary_audience: r.primary_audience })),
-  })})
+ToolSearch query="select:mcp__latent-defense__triage_save_project,mcp__latent-defense__pipeline_status" max_results=2
+
+Call pipeline_status(project_id="${profileId}") to get final state.
+Then call triage_save_project("${profileId}", <JSON with the pipeline_status results>).
 `, { label: 'save-results', phase: 'Route', model: 'haiku' })
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Phase 7: Deliver per audience
+// Phase 7: Deliver — only generate missing audience outputs
 // ═══════════════════════════════════════════════════════════════
 phase('Deliver')
 log(`Generating outputs for ${audiences.length} audience(s)...`)
-
-const byAudience = {}
-for (const a of audiences) byAudience[a.name] = []
-for (const r of allResolutions) {
-  const target = r.primary_audience || audiences[0]?.name
-  if (byAudience[target]) byAudience[target].push(r)
-}
 
 const outputs = await parallel(
   audiences.map(audience => () =>
@@ -614,15 +758,13 @@ ${audience.not_include ? `Do NOT include: ${audience.not_include}` : ''}
 
 ${REPORT_METHODOLOGY}
 
-## Data
-- ${totalFindings} findings → ${allGroups.length} groups
-- Resolutions: ${JSON.stringify(resDist)}
+## Load data from findings store
+${INVESTIGATE_TOOLS}
 
-## Items for this audience (${byAudience[audience.name]?.length || 0})
-${JSON.stringify(byAudience[audience.name]?.slice(0, 30) || [], null, 2)}
-
-## All investigated items
-${JSON.stringify(verified.slice(0, 15), null, 2)}
+Call findings_stats(project_id="${profileId}") for totals.
+Call list_groups(project_id="${profileId}") for all groups.
+For each group, call get_investigation(project_id="${profileId}", group_id=<id>) for verdict+evidence.
+Filter to items relevant to this audience (match primary_audience).
 
 Save to: ${outputDir}/${audience.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.md
 `, { label: `deliver-${audience.name}`, phase: 'Deliver', model: 'opus' })
@@ -642,20 +784,26 @@ Call triage_save_project("${profileId}", ${JSON.stringify({ outputs: outputFiles
 `, { label: 'save-outputs', phase: 'Deliver', model: 'haiku' })
 }
 
+// Build resolution distribution from the store
+const finalStatus = await agent(`
+${FINDINGS_TOOLS}
+Call pipeline_status(project_id="${profileId}").
+Return the full result.
+`, { label: 'final-status', phase: 'Deliver', model: 'haiku', schema: {
+  type: 'object', properties: {
+    total_findings: { type: 'integer' }, groups: { type: 'integer' },
+    investigated: { type: 'integer' }, phases: { type: 'object' },
+  },
+}})
+
 return {
   status: 'completed',
   config: { sources: sources.map(s => s.name || s.type), audiences: audiences.map(a => a.name), branch_id: branchId },
   results: {
-    total_findings: totalFindings,
-    groups: allGroups.length,
-    collapse_ratio: Math.round(10 * totalFindings / Math.max(1, allGroups.length)) / 10,
-    investigated: verified.length,
-    resolutions: resDist,
-    coverage_pct: Math.round(100 * claimedGlobal.size / totalFindings),
-    unclaimed: finalUnclaimed.length,
-    double_claimed: doubleClaimed.length,
+    total_findings: totalFindings || finalStatus?.total_findings || 0,
+    groups: finalStatus?.groups || 0,
+    investigated: finalStatus?.investigated || 0,
   },
-  groups: allGroups.map(g => ({ group_id: g.group_id, title: g.annotation?.title, finding_count: g.claimed_findings?.length || 0, canonical_type: g.annotation?.canonical_type, energy: g.energy_analysis || null })),
   outputs: outputFiles,
   profile_id: profileId,
 }

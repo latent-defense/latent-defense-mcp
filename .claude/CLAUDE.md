@@ -53,6 +53,35 @@ Every investigation follows five moves:
 
 Energy scores tell you WHERE to look. They are the input to investigation, never the output.
 
+### Keeping the graph accurate
+
+**When you verify something against a source of truth and the graph is wrong, fix it.** This is not optional — a graph that lies about infrastructure is worse than an incomplete graph. If you read a node, check the real state via `kubectl` / `az` / `aws` / `gh api`, and find the graph's metadata is stale, its description is inaccurate, or a relationship is missing — update the graph right then using the observation tools. Every investigation that touches a node either confirms it or corrects it.
+
+The observation tools are: `add_node`, `edit_node`, `delete_node`, `add_edge`, `edit_edge`, `delete_edge`, `edit_subgraph`, `bulk_edit_edges`, `pending_changes`, `rollback_changes`, `commit_graph`, `rollback_to_commit`.
+
+This only applies when you have **grounded evidence** — output from a CLI command, a file you read, an API response. Never correct the graph based on your own assumptions or expectations. The graph was built from real infrastructure; when it contradicts you, verify before concluding it's wrong.
+
+**How:**
+- `read_node` or `read_edge` before editing (the tools enforce this).
+- Verify against the user's `verification_channels` in their profile (`triage_load_user`). If no channels are configured, ask the user how to verify. Never guess.
+- `edit_node` sparse-merges metadata — only the keys you provide change, everything else survives.
+- Before adding a node or edge, check a peer of the same type for naming and metadata conventions (`find_nodes_by_type`, then `read_node` on one).
+- New nodes have no energy scores until inference re-runs. That's expected.
+- In parallel pipelines (triage), accumulate corrections and apply as a batch after all agents complete.
+
+**Tool capabilities:**
+- `edit_node` deep-merges metadata recursively — `{"resources": {"cpu": "200m"}}` merges into `{"resources": {"cpu": "100m", "memory": "256Mi"}}` preserving `memory`. Use `remove_keys` with dot-paths (e.g. `["resources.cpu", "labels.env"]`) to delete specific metadata keys. You can also change a node's `type` directly.
+- `edit_edge` supports changing `source` and `target` to rewire connections, plus the same deep merge and `remove_keys` as `edit_node`.
+- `edit_subgraph` applies multiple add/remove/modify operations atomically — the graph equivalent of rewriting a file.
+- `bulk_edit_edges` edits all edges matching a filter (type, source, target). Default is `dry_run=true` to preview before committing.
+
+**Persisting changes:**
+- Every mutation auto-saves the delta to `~/.latent-defense/graph-cache/<branch>.delta.json`. The delta survives MCP server restarts — `load_graph_energies` restores it and reports pending changes.
+- Call `commit_graph(message)` to persist accumulated changes to infradb. On success the delta is cleared. On failure the delta is preserved for retry.
+- Call `rollback_changes()` to discard all pending changes without persisting.
+- In the triage pipeline, graph corrections accumulate during investigation and are committed as a batch between the Investigate and Route phases.
+- **After `commit_graph`, re-encode the graph** by calling `load_graph_energies(branch_id, force_refresh=true)`. This deletes the stale local cache, fetches the updated graph from infradb, and triggers JEPA re-encoding so new/modified nodes and edges get fresh energy scores. Without this step, new nodes have null energy and energy tools can't score paths through them. Do NOT use `run_inference` — that spawns a server-side attack path pipeline, not a local re-encoding.
+
 ### Compensating controls
 
 When the model shows braking energy on a hop, it detected a structural barrier. Use `read_node` on both endpoints to identify the specific control — a security boundary, an auth check, a network policy. The model finds defenses, not just risks.
@@ -75,6 +104,39 @@ Always look for the control's **limitations** in the node description. The graph
 - Know about controls not represented in the graph
 - Guarantee completeness (the graph is only as complete as the mapping)
 - Replace human judgment on exploitability (it provides structural evidence, not verdicts)
+
+## Before you start
+
+**Check authentication before doing anything that touches the deployment.** Call `connection_status()` or `whoami()` at the start of any session that needs remote access (loading graphs, running inference, triggering scans). If auth has expired, tell the user immediately — don't proceed and fail silently. Graph tools that read from the local disk cache work without auth, but anything that hits the remote server requires it.
+
+## Quick start
+
+```
+1. connection_status()                  # Verify auth is live
+2. load_graph_energies(branch_id)      # Load graph + JEPA energies into local cache
+3. grep_nodes("keyword")               # Find nodes by name/description
+   energy_entry_points(branch_id)      # Or discover entry points
+4. energy_trace_to_target(             # Trace paths from entry to target
+     branch_id, source_id, target_id)
+5. energy_momentum_path(               # Score the path (0–100)
+     branch_id, node_ids)
+6. submit_attack_path(...)             # Submit a validated finding
+```
+
+All graph and energy tools require `load_graph_energies` to be called first. The cache persists across sessions.
+
+## Evidence hierarchy
+
+When interpreting results, weight evidence in this order:
+
+1. **Source code** — the definitive truth
+2. **Configuration files** — what is configured
+3. **Cloud API state** — what is deployed
+4. **Semantic context** — graph node descriptions
+5. **Graph structure** — relationships and topology
+6. **Energy scores** — structural resistance signals
+
+Energy is the input to investigation, never the output. Always verify energy-highlighted areas against higher-tier evidence before drawing conclusions.
 
 ## Available skills
 
@@ -124,9 +186,27 @@ Eight agentic prompts expand into structured instructions for the calling agent:
 
 For large graphs (1000+ nodes), `load_graph_energies` handles JEPA warm-up internally. The SQLite cache survives process restarts — subsequent loads are instant.
 
-**Graph tools** (8): `read_node`, `read_edge`, `get_connected_edges`, `get_graph_statistics`, `grep_nodes`, `grep_edges`, `find_nodes_by_type`, `find_edges_by_type`
+### Tool tiers
 
-**Energy tools** (12): `energy_node_scores`, `energy_edge_scores`, `energy_momentum_path`, `energy_lowest_hop`, `energy_lowest_paths`, `energy_trace_to_target`, `energy_compare_paths`, `energy_node_neighborhood`, `energy_entry_points`, `energy_defenses`, `energy_top_attack_paths`, `energy_chokepoints`
+**Foundation** — load and cache before any analysis:
+
+| Tool | Purpose |
+|------|---------|
+| `load_graph_energies` | Load graph + JEPA energies into local SQLite cache. Required first. |
+| `load_branch` | Load a branch without energies (graph-only). |
+| `wait_for_load` | Wait for async load to complete. |
+
+**Read** (8): `read_node`, `read_edge`, `get_connected_edges`, `get_graph_statistics`, `grep_nodes`, `grep_edges`, `find_nodes_by_type`, `find_edges_by_type`
+
+**Analyze** (12): `energy_node_scores`, `energy_edge_scores`, `energy_momentum_path`, `energy_lowest_hop`, `energy_lowest_paths`, `energy_trace_to_target`, `energy_compare_paths`, `energy_node_neighborhood`, `energy_entry_points`, `energy_defenses`, `energy_top_attack_paths`, `energy_chokepoints`
+
+**Observe** (12): `add_node`, `edit_node`, `delete_node`, `add_edge`, `edit_edge`, `delete_edge`, `edit_subgraph`, `bulk_edit_edges`, `pending_changes`, `rollback_changes`, `commit_graph`, `rollback_to_commit` — correct the graph when investigation reveals inaccuracies. See "Keeping the graph accurate" above.
+
+**Act** (11): `submit_attack_path`, `validate_path`, `dismiss_path`, `undismiss_path`, `update_path_status`, `override_risk_score`, `clear_risk_override`, `add_path_comment`, `edit_path_comment`, `bulk_update_paths`, `ingest_detection`
+
+**Manage** (12): `create_mapping_run`, `cancel_mapping_run`, `run_inference`, `create_connector`, `update_connector`, `delete_connector`, `test_connector`, `poll_connector`, `register_webhook`, `delete_webhook`, `test_webhook`, `validate_webhook_template`
+
+**Triage** (13): `load_findings`, `query_findings`, `get_finding`, `findings_stats`, `claim_findings`, `claim_findings_range`, `claim_findings_by_query`, `unclaim_findings`, `create_group`, `update_group`, `list_groups`, `save_investigation`, `get_investigation` — SQLite-backed findings store for the triage pipeline. Agents query and claim findings via tools instead of passing index arrays.
 
 ## Session state
 
@@ -136,9 +216,11 @@ Local filesystem persistence (`~/.latent-defense/triage-state/`) for cross-sessi
 
 Every investigation skill loads user context and project state at session start.
 
-**User profiles** (`triage_save_user`, `triage_load_user`): identity, role, pain points, team, verification channels, ticketing integration. Persists forever.
+**User profiles** (`triage_save_user`, `triage_load_user`): identity, role, pain points, team, verification channels, ticketing integration. Persists forever. The `verification_channels` field defines how this user's infrastructure claims should be verified (source code access, cloud CLI, kubernetes contexts). If a profile has no verification channels, ask the user to provide them before making graph corrections.
 
 **Projects** (`triage_save_project`, `triage_load_project`): per-engagement state — branch, findings, verdicts, work items, decisions. Survives session boundaries.
+
+**Findings store** (`load_findings`, `query_findings`, `claim_findings_by_query`, etc.): SQLite database at `~/.latent-defense/triage-state/findings-<project>.db`. Stores all findings with indexed columns for fast queries. Agents claim findings into groups via MCP tools — no index arrays in structured output. State persists across sessions and is shared by all pipeline agents.
 
 **Actions**: `triage_update_finding_group`, `triage_add_work_item`, `triage_add_decision`, `triage_get_workflow_args` — update status, assign work, record risk decisions, bridge into workflow execution.
 

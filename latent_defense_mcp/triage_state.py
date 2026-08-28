@@ -134,7 +134,30 @@ def register(mcp: Any) -> None:
             with open(path) as f:
                 existing = json.load(f)
 
+        # Config fields are protected once set — pipeline agents cannot overwrite them.
+        # Only the user (via /triage setup or direct triage_save_project) can set these initially.
+        # After that, they're locked. This prevents agents from corrupting project config
+        # (e.g., overwriting branch_id with "main" from a context string).
+        PROTECTED_FIELDS = {
+            "branch_id", "sources", "audiences", "verification_channels",
+            "deployment_model", "source_code_access", "cloud_access",
+        }
+
         for key, val in data.items():
+            # Config fields are locked once they have a meaningful value.
+            # Empty string, None, and empty list [] are NOT meaningful — allow overwrite.
+            # A real branch_id like "branch_d0229f3abefb" IS meaningful — block overwrite.
+            if key in PROTECTED_FIELDS and key in existing:
+                existing_val = existing[key]
+                has_value = (
+                    existing_val is not None
+                    and existing_val != ""
+                    and existing_val != []
+                    and existing_val != {}
+                )
+                if has_value:
+                    # Protected field already set with real value — skip silently
+                    continue
             if isinstance(val, dict) and isinstance(existing.get(key), dict):
                 existing[key].update(val)
             else:
@@ -201,7 +224,11 @@ def register(mcp: Any) -> None:
 
     @mcp.tool()
     async def triage_update_finding_group(project_id: str, group_id: str, update: str) -> str:
-        """Update the status of a finding group within a project.
+        """[DEPRECATED] Update a finding group within a project.
+
+        Use update_group() from the findings store instead — it provides
+        richer group management with SQLite-backed state, query support,
+        and integration with the claim/investigation tools.
 
         Args:
             project_id: Project identifier.

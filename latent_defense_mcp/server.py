@@ -2995,83 +2995,79 @@ notes, and MITRE ATT&CK technique IDs where applicable.
 @mcp.prompt(
     title="Triage discovery",
     description=(
-        "Process scanner findings: read, cluster by remediation action, refine with "
-        "energy analysis. Phases 1-4 of the triage pipeline."
+        "Process scanner findings: load into store, cluster by remediation action, "
+        "claim with energy-guided splits.  Phases 1-4 of the triage pipeline."
     ),
 )
 def triage_discover(
+    project_id: str,
     sources: str,
     branch_id: str,
 ) -> str:
-    """Read findings, cluster by remediation, and refine with energy analysis.
+    """Load findings, cluster by remediation, claim via MCP tools.
 
     Args:
-        sources: Comma-separated list of finding source files or descriptions.
+        project_id: Triage project identifier (for findings store).
+        sources: Comma-separated list of finding source file paths.
         branch_id: Branch ID to load for energy analysis.
     """
     return f"""\
 You are processing scanner findings through the structural triage pipeline.
 
+**Project**: {json.dumps(project_id)}
 **Sources**: {json.dumps(sources)}
 **Branch**: {json.dumps(branch_id)}
 
-## Energy Method
+## Phase 1 — Load Findings
 
-Energy scores represent structural resistance. Use them to PRIORITIZE, not to
-decide. The workflow:
-1. What does the energy say? (structural signal)
-2. What does the finding say? (scanner signal)
-3. What does the code/config say? (ground truth)
+Call `load_findings(project_id={json.dumps(project_id)}, path=<source_path>)` for each source file.
+This loads all findings into a queryable SQLite store.
+Call `findings_stats(project_id={json.dumps(project_id)})` to see the distribution by severity, scanner, and category.
 
-Never skip step 3. Energy tells you where to look; the code tells you what's real.
+## Phase 2 — Create Groups
 
-## Resolution Categories
+Review the findings distribution. Ask: "if I were fixing these, what batches of work would I create?"
+Target 8-20 groups based on REMEDIATION ACTION — not per-service, per-scanner, or per-CVE.
 
-After investigation, each finding group resolves to one of:
-- **Eliminable**: Can be fully fixed (patch, config change, code fix)
-- **Reducible**: Can reduce severity (add controls, restrict access)
-- **Constrained**: Accepted risk with documented justification
-- **Drift-prone**: Fixed now but will recur without automation
-- **Mitigated**: Compensating controls make it low-priority
+Common patterns: package CVEs per image, missing auth across services, CI/CD supply chain,
+Dockerfile hygiene, default credentials, missing network policies, IaC drift, code defects.
 
-## Phase 1 — Read All Findings
+For each group, call:
+    `create_group(project_id={json.dumps(project_id)}, group_id=<short-id>, description=<remediation action>)`
 
-Read the source files and extract every finding. For each, capture:
-- Finding ID / title
-- Severity (from the scanner)
-- Affected resource
-- Description
+## Phase 3 — Claim Findings
 
-## Phase 2 — Cluster by Remediation Action
+For each group, claim its findings using the query-based claim tools:
 
-Group findings by what batch of work would fix them:
-- Same package upgrade? → one group
-- Same config change? → one group
-- Same IAM policy fix? → one group
+1. Preview first: `claim_findings_by_query(project_id, group_id, scanner=..., keyword=..., dry_run=true)`
+   Review the sample — are these the right findings for this group?
+2. Claim: `claim_findings_by_query(project_id, group_id, ..., dry_run=false)`
+3. For contiguous scanner blocks: `claim_findings_range(project_id, group_id, start, end, dry_run=true)` then `dry_run=false`
+4. For specific findings: `claim_findings(project_id, group_id, indices="0,3,7")`
 
-Name each group by the remediation action, not by the finding title.
+The store prevents double-claims automatically. A finding can only belong to one group.
 
-## Phase 3 — Energy Refinement
+## Phase 4 — Energy Refinement
 
     load_graph_energies(branch_id={json.dumps(branch_id)})
 
 For each group's anchor nodes:
-    energy_node_scores(node_ids=<comma-separated node IDs>)
-    energy_trace_to_target(source_id=<anchor_node>, target_types="credential,data_store,database")
+    `energy_node_scores(node_ids=<comma-separated node IDs>)`
+    `energy_trace_to_target(source_id=<anchor_node>, target_types="credential,data_store,database")`
 
 Use energy scores to:
-- Merge groups whose remediation overlaps
-- Split groups where energy reveals different risk profiles
+- Split groups where energy reveals different risk profiles (spread > 2.0)
 - Prioritize groups by structural exposure
+- Update group with anchor: `update_group(project_id, group_id, anchor_node=<node_id>)`
 
-## Phase 4 — Assign Unclaimed Findings
+## Phase 5 — Sweep Unclaimed
 
-Any finding not yet in a group: find its nearest node in the graph with
-grep_nodes, check energy_node_scores, and assign to the group whose
-anchor node is structurally closest.
+Call `query_findings(project_id={json.dumps(project_id)}, unclaimed_only=true)` to see what's left.
+For each unclaimed finding, assign to the closest group or create a new one.
 
-Present the final grouping as a table:
-| Group | Remediation Action | Findings | Anchor Nodes | Structural Risk |
+After sweep, call `findings_stats` and verify unclaimed count is 0.
+
+Present the final grouping using `list_groups(project_id={json.dumps(project_id)})`.
 """
 
 
@@ -3079,20 +3075,20 @@ Present the final grouping as a table:
     title="Investigate a finding group",
     description=(
         "Deep investigation of one finding group using energy analysis and "
-        "verification against code/config/cloud."
+        "verification against code/config/cloud. Reads findings from the store."
     ),
 )
 def triage_investigate_group(
-    group_description: str,
-    findings: str,
+    project_id: str,
+    group_id: str,
     branch_id: str,
     verification_channels: str = "",
 ) -> str:
     """Investigate a single finding group.
 
     Args:
-        group_description: What this group is about (the remediation action).
-        findings: JSON array or comma-separated list of finding IDs/descriptions in this group.
+        project_id: Triage project identifier (for findings store).
+        group_id: Group to investigate (findings are read from the store).
         branch_id: Branch ID (graph must already be loaded via load_graph_energies).
         verification_channels: Comma-separated verification sources (e.g. "source_code,aws_cli,k8s").
     """
@@ -3108,10 +3104,16 @@ You are investigating a finding group for structural triage.
 
 Prerequisites: load_graph_energies(branch_id) must have been called before using these tools.
 
-**Group**: {json.dumps(group_description)}
-**Findings**: {json.dumps(findings)}
+**Project**: {json.dumps(project_id)}
+**Group**: {json.dumps(group_id)}
 **Branch**: {json.dumps(branch_id)}
 {verify_hint}
+
+## Load Group Data
+
+Call `query_findings(project_id={json.dumps(project_id)}, group_id={json.dumps(group_id)})` to read all findings in this group.
+Call `get_finding(project_id, idx)` for full details on specific findings.
+
 ## Energy Interpretation
 
 Energy is structural resistance — negative means accelerating (low resistance), positive means braking (control/boundary). Magnitude matters: -3.0 is much less resistance than -0.5.
@@ -3155,18 +3157,21 @@ Produce a verdict for this group:
 - **Evidence**: cite specific code, config, or cloud state
 - **Priority**: based on risk score band AND verification results
 - **Recommended action**: specific remediation steps
+
+Save results: `save_investigation(project_id={json.dumps(project_id)}, group_id={json.dumps(group_id)}, verdict=..., evidence=..., graph_corrections=...)`
+Also update group: `update_group(project_id={json.dumps(project_id)}, group_id={json.dumps(group_id)}, resolution=..., action=..., status="investigated")`
 """
 
 
 @mcp.prompt(
     title="Deliver triage report",
     description=(
-        "Generate an audience-specific report from triage results. "
-        "Action table first, evidence from code/config, no model internals."
+        "Generate an audience-specific report from triage results stored in the "
+        "findings store.  Reads groups + investigations via MCP tools."
     ),
 )
 def triage_deliver(
-    results: str,
+    project_id: str,
     audience_name: str,
     audience_needs: str = "",
     report_outline: str = "",
@@ -3174,7 +3179,7 @@ def triage_deliver(
     """Generate an audience-specific triage report.
 
     Args:
-        results: JSON string or description of triage investigation results.
+        project_id: Triage project identifier (reads results from findings store).
         audience_name: Who this report is for (e.g. "engineering_lead", "ciso", "platform_team").
         audience_needs: What this audience cares about (e.g. "what to fix this sprint").
         report_outline: Optional custom report structure.
@@ -3188,10 +3193,20 @@ Follow this report outline: {json.dumps(report_outline)}
     return f"""\
 You are generating a triage report for a specific audience.
 
+**Project**: {json.dumps(project_id)}
 **Audience**: {json.dumps(audience_name)}
 **Needs**: {json.dumps(audience_needs) if audience_needs else "Not specified — use defaults for this audience type."}
-**Results**: {json.dumps(results)}
 {outline_hint}
+
+## Load Results
+
+Call `findings_stats(project_id={json.dumps(project_id)})` for total counts and distribution.
+Call `list_groups(project_id={json.dumps(project_id)})` for all groups with finding counts and resolutions.
+Call `get_investigation(project_id={json.dumps(project_id)}, group_id=<id>)` for each group's verdict and evidence.
+
+**Completeness check:** ALL groups must have verdicts before generating a report.
+If any group has no investigation, refuse and list the missing groups.
+
 ## Report Rules
 
 1. **Action table first**. The report opens with what to fix, who owns it, and
@@ -3281,7 +3296,7 @@ def _stop_jepa_keepalive():
 
 
 @mcp.tool()
-async def load_graph_energies(branch_id: str) -> str:
+async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> str:
     """Load an infrastructure graph with energy scores into the local cache.
 
     This is the single entry point for all graph and energy analysis. It:
@@ -3293,8 +3308,31 @@ async def load_graph_energies(branch_id: str) -> str:
 
     All energy_*, grep_*, read_*, find_*, and get_graph_statistics tools
     require this to be called first.
+
+    Args:
+        branch_id: Branch to load.
+        force_refresh: Delete the local cache and re-fetch from the server.
+            Use after commit_graph() to get fresh JEPA energy scores for
+            newly added or modified nodes and edges.
     """
     global _energy_cache
+
+    # Force refresh: delete cache file so we re-fetch from remote
+    if force_refresh:
+        from .energy_cache import _db_path
+        db_file = _db_path(branch_id)
+        # Close all connections before deleting — SQLite WAL mode leaves
+        # -wal and -shm journal files that cause I/O errors if the main
+        # .db is deleted while connections are open.
+        if _energy_cache is not None:
+            _energy_cache.close()
+            _energy_cache = None
+        # Remove the db file and any WAL/SHM journals
+        for suffix in ("", "-wal", "-shm"):
+            p = db_file.parent / (db_file.name + suffix)
+            if p.exists():
+                p.unlink()
+        log.info("Cache deleted for branch %s — will re-fetch from remote", branch_id)
 
     # Try reloading from existing SQLite cache on disk (survives process restart)
     cached = EnergyGraphCache.from_disk(branch_id)
@@ -3304,7 +3342,10 @@ async def load_graph_energies(branch_id: str) -> str:
         _energy_cache = cached
         if cached.has_energies and cached.repository_id:
             _start_jepa_keepalive(branch_id, cached.repository_id)
-        return json.dumps({
+        # Restore persisted delta from previous session (if any)
+        pending = observation_tools.load_delta_from_disk(branch_id)
+
+        result = {
             "status": "loaded",
             "source": "disk_cache",
             "branch_id": branch_id,
@@ -3315,7 +3356,14 @@ async def load_graph_energies(branch_id: str) -> str:
             "n_containment_edges": cached._n_containment,
             "commit_id": cached.commit_id,
             "has_energies": cached.has_energies,
-        })
+        }
+        if pending:
+            result["pending_changes"] = pending
+            result["pending_note"] = (
+                f"{pending} uncommitted graph changes from a previous session. "
+                "Call pending_changes() to review or commit_graph() to persist."
+            )
+        return json.dumps(result)
 
     try:
         client = await _http()
@@ -3389,6 +3437,9 @@ async def load_graph_energies(branch_id: str) -> str:
     if cache.has_energies and cache.repository_id:
         _start_jepa_keepalive(branch_id, cache.repository_id)
 
+    # Restore persisted delta from previous session (if any)
+    pending = observation_tools.load_delta_from_disk(branch_id)
+
     result: dict[str, Any] = {
         "status": "loaded",
         "branch_id": branch_id,
@@ -3414,6 +3465,12 @@ async def load_graph_energies(branch_id: str) -> str:
             "before delivering results. Energy tools will work but some edges "
             "will have no energy scores."
         )
+    if pending:
+        result["pending_changes"] = pending
+        result["pending_note"] = (
+            f"{pending} uncommitted graph changes from a previous session. "
+            "Call pending_changes() to review or commit_graph() to persist."
+        )
     return json.dumps(result)
 
 
@@ -3422,10 +3479,12 @@ async def load_graph_energies(branch_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-from . import energy_tools, graph_tools, triage_state  # noqa: E402
+from . import energy_tools, findings_store, graph_tools, observation_tools, triage_state  # noqa: E402
 
 graph_tools.register(mcp, _get_energy_cache)
 energy_tools.register(mcp, _get_energy_cache)
+observation_tools.register(mcp, _get_energy_cache, post_fn=_post)
+findings_store.register(mcp)
 triage_state.register(mcp)
 
 

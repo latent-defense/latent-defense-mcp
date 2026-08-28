@@ -21,6 +21,40 @@ import httpx
 
 log = logging.getLogger("latent-defense-mcp")
 
+
+def _deep_merge(base: dict, updates: dict) -> dict:
+    """Recursively merge *updates* into *base*.  Lists and non-dict values
+    are replaced; nested dicts are merged recursively."""
+    result = {**base}
+    for key, val in updates.items():
+        if isinstance(val, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+def _remove_keys(metadata: dict, keys: list[str]) -> dict:
+    """Remove dot-path keys from a metadata dict.  Returns a new dict.
+
+    >>> _remove_keys({"a": 1, "b": {"c": 2, "d": 3}}, ["a", "b.c"])
+    {'b': {'d': 3}}
+    """
+    result = json.loads(json.dumps(metadata))  # deep copy
+    for key_path in keys:
+        parts = key_path.split(".")
+        obj = result
+        for part in parts[:-1]:
+            if isinstance(obj, dict) and part in obj:
+                obj = obj[part]
+            else:
+                break
+        else:
+            if isinstance(obj, dict) and parts[-1] in obj:
+                del obj[parts[-1]]
+    return result
+
+
 _CACHE_DIR = Path(os.environ.get(
     "GRAPH_CACHE_DIR",
     Path.home() / ".latent-defense" / "graph-cache",
@@ -434,6 +468,277 @@ class EnergyGraphCache:
                 raise
             log.info("Entry energies request failed (%s)", exc)
             return []
+
+    # ------------------------------------------------------------------
+    # Write support (used by observation tools)
+    # ------------------------------------------------------------------
+
+    def enable_writes(self) -> None:
+        """Transition the cache to read-write mode.
+
+        Opens a WAL-mode write connection alongside the existing read-only
+        connection.  WAL allows concurrent readers while writes happen.
+        """
+        if self._write_db is not None:
+            return  # already enabled
+        if self._db_path is None:
+            raise RuntimeError("No graph loaded — call load_graph_energies first.")
+        self._write_db = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._write_db.execute("PRAGMA journal_mode=WAL")
+        self._write_db.execute("PRAGMA synchronous=NORMAL")
+        # Close the read-only connection — reopen as read-write so it sees
+        # its own writes immediately.
+        if self._read_db is not None:
+            self._read_db.close()
+            self._read_db = None
+        self._read_db = sqlite3.connect(self._db_path, check_same_thread=False)
+        log.info("Graph cache: write mode enabled (WAL)")
+
+    @property
+    def writable(self) -> bool:
+        return self._write_db is not None
+
+    def write_node(
+        self,
+        name: str,
+        node_type: str,
+        semantic_context: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        """Insert or replace a node in the local cache."""
+        db = self._write_db
+        if db is None:
+            raise RuntimeError("Writes not enabled — call enable_writes() first.")
+        db.execute(
+            "INSERT OR REPLACE INTO nodes (name, type, semantic_context, metadata) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                name,
+                node_type,
+                json.dumps(semantic_context) if semantic_context else None,
+                json.dumps(metadata) if metadata else "{}",
+            ),
+        )
+        db.commit()
+
+    def update_node_metadata(
+        self,
+        name: str,
+        metadata: dict | None = None,
+        semantic_context: list[str] | None = None,
+        node_type: str | None = None,
+        remove_keys_list: list[str] | None = None,
+    ) -> dict | None:
+        """Sparse-merge metadata and/or replace semantic_context on an existing node.
+
+        Args:
+            metadata: Keys to merge (deep merge — nested dicts are merged recursively).
+            semantic_context: Replace if provided.
+            node_type: Change the node type if provided.
+            remove_keys_list: Dot-path keys to remove from metadata.
+
+        Returns the previous state of the node, or None if not found.
+        """
+        db = self._write_db
+        if db is None:
+            raise RuntimeError("Writes not enabled — call enable_writes() first.")
+
+        # Read current state
+        row = db.execute(
+            "SELECT name, type, semantic_context, metadata, entry_energy, energy_type "
+            "FROM nodes WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        before = self._node_from_row(row)
+
+        # Change type if requested
+        if node_type is not None:
+            db.execute("UPDATE nodes SET type = ? WHERE name = ?", (node_type, name))
+
+        # Remove keys first (before merge, so merge can re-add if needed)
+        if remove_keys_list:
+            current_meta = {**before.get("metadata", {})}
+            current_meta = _remove_keys(current_meta, remove_keys_list)
+            db.execute(
+                "UPDATE nodes SET metadata = ? WHERE name = ?",
+                (json.dumps(current_meta), name),
+            )
+            # Re-read for the merge step
+            before_for_merge = {**current_meta}
+        else:
+            before_for_merge = {**before.get("metadata", {})}
+
+        # Deep-merge metadata — nested dicts are merged recursively
+        if metadata:
+            current_meta = _deep_merge(before_for_merge, metadata)
+            db.execute(
+                "UPDATE nodes SET metadata = ? WHERE name = ?",
+                (json.dumps(current_meta), name),
+            )
+
+        # Replace semantic_context if provided
+        if semantic_context is not None:
+            db.execute(
+                "UPDATE nodes SET semantic_context = ? WHERE name = ?",
+                (json.dumps(semantic_context), name),
+            )
+
+        db.commit()
+        return before
+
+    def write_edge(
+        self,
+        name: str,
+        edge_type: str,
+        source: str,
+        target: str,
+        semantic_context: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        """Insert or replace an edge in the local cache."""
+        db = self._write_db
+        if db is None:
+            raise RuntimeError("Writes not enabled — call enable_writes() first.")
+        db.execute(
+            "INSERT OR REPLACE INTO edges "
+            "(name, type, source, target, semantic_context, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                name,
+                edge_type,
+                source,
+                target,
+                json.dumps(semantic_context) if semantic_context else None,
+                json.dumps(metadata) if metadata else "{}",
+            ),
+        )
+        db.commit()
+
+    def update_edge_metadata(
+        self,
+        name: str,
+        metadata: dict | None = None,
+        semantic_context: list[str] | None = None,
+        source: str | None = None,
+        target: str | None = None,
+        remove_keys_list: list[str] | None = None,
+    ) -> dict | None:
+        """Sparse-merge metadata and/or replace semantic_context on an existing edge.
+
+        Args:
+            metadata: Keys to merge (deep merge — nested dicts are merged recursively).
+            semantic_context: Replace if provided.
+            source: Change the edge source node if provided.
+            target: Change the edge target node if provided.
+            remove_keys_list: Dot-path keys to remove from metadata.
+
+        Returns the previous state of the edge, or None if not found.
+        """
+        db = self._write_db
+        if db is None:
+            raise RuntimeError("Writes not enabled — call enable_writes() first.")
+
+        cols = "name, type, source, target, semantic_context, metadata, transition_energy, energy_type"
+        row = db.execute(f"SELECT {cols} FROM edges WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            return None
+
+        before = self._edge_from_row(row)
+
+        # Change source/target if requested
+        if source is not None:
+            db.execute("UPDATE edges SET source = ? WHERE name = ?", (source, name))
+        if target is not None:
+            db.execute("UPDATE edges SET target = ? WHERE name = ?", (target, name))
+
+        # Remove keys first
+        if remove_keys_list:
+            current_meta = {**before.get("metadata", {})}
+            current_meta = _remove_keys(current_meta, remove_keys_list)
+            db.execute(
+                "UPDATE edges SET metadata = ? WHERE name = ?",
+                (json.dumps(current_meta), name),
+            )
+            before_for_merge = {**current_meta}
+        else:
+            before_for_merge = {**before.get("metadata", {})}
+
+        # Deep-merge metadata
+        if metadata:
+            current_meta = _deep_merge(before_for_merge, metadata)
+            db.execute(
+                "UPDATE edges SET metadata = ? WHERE name = ?",
+                (json.dumps(current_meta), name),
+            )
+
+        if semantic_context is not None:
+            db.execute(
+                "UPDATE edges SET semantic_context = ? WHERE name = ?",
+                (json.dumps(semantic_context), name),
+            )
+
+        db.commit()
+        return before
+
+    def delete_node(self, name: str, cascade_edges: bool = True) -> dict:
+        """Delete a node from the local cache.
+
+        Returns {deleted_node, deleted_edges} with the removed data.
+        """
+        db = self._write_db
+        if db is None:
+            raise RuntimeError("Writes not enabled — call enable_writes() first.")
+
+        # Read the node before deleting
+        row = db.execute(
+            "SELECT name, type, semantic_context, metadata, entry_energy, energy_type "
+            "FROM nodes WHERE name = ?",
+            (name,),
+        ).fetchone()
+        node_data = self._node_from_row(row) if row else None
+
+        deleted_edges = []
+        if cascade_edges:
+            cols = "name, type, source, target, semantic_context, metadata, transition_energy, energy_type"
+            for erow in db.execute(
+                f"SELECT {cols} FROM edges WHERE source = ? OR target = ?",
+                (name, name),
+            ).fetchall():
+                deleted_edges.append(self._edge_from_row(erow))
+            db.execute("DELETE FROM edges WHERE source = ? OR target = ?", (name, name))
+
+        db.execute("DELETE FROM nodes WHERE name = ?", (name,))
+        db.commit()
+
+        return {"deleted_node": node_data, "deleted_edges": deleted_edges}
+
+    def delete_edge(self, name: str) -> dict | None:
+        """Delete an edge from the local cache. Returns the deleted edge data."""
+        db = self._write_db
+        if db is None:
+            raise RuntimeError("Writes not enabled — call enable_writes() first.")
+
+        cols = "name, type, source, target, semantic_context, metadata, transition_energy, energy_type"
+        row = db.execute(f"SELECT {cols} FROM edges WHERE name = ?", (name,)).fetchone()
+        edge_data = self._edge_from_row(row) if row else None
+
+        db.execute("DELETE FROM edges WHERE name = ?", (name,))
+        db.commit()
+        return edge_data
+
+    def refresh_stats(self) -> None:
+        """Recompute cached statistics after writes."""
+        db = self._write_db or self.db
+        self._n_nodes = db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        self._n_edges = db.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        self._n_node_types = db.execute("SELECT COUNT(DISTINCT type) FROM nodes").fetchone()[0]
+        self._n_edge_types = db.execute("SELECT COUNT(DISTINCT type) FROM edges").fetchone()[0]
+        self._n_containment = db.execute(
+            "SELECT COUNT(*) FROM edges WHERE type = 'contains'"
+        ).fetchone()[0]
 
     # ------------------------------------------------------------------
     # Query helpers (used by tool modules)

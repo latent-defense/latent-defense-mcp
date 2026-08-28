@@ -9,3 +9,5 @@ experiments/
 scratch/
 .pytest_cache/
 .claude/worktrees/
+tmp/
+uv.lock
