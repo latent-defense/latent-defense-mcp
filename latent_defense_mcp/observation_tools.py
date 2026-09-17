@@ -308,6 +308,29 @@ class ObservationDelta:
 # Shared state — one per MCP server process
 # ---------------------------------------------------------------------------
 
+def _require_semantic_context(semantic_context: list[str] | None, kind: str) -> str | None:
+    """Reject nodes/edges written without a description.
+
+    The JEPA encoder embeds every node and edge from its semantic_context lines.
+    An element with no context lines gets an all-zero context mask, the encoder's
+    masked pooling divides by zero, and the resulting NaN propagates through
+    message passing to everything within two hops. Returns an error JSON string
+    when the context is missing or blank, else None.
+    """
+    lines = [l for l in (semantic_context or []) if isinstance(l, str) and l.strip()]
+    if lines:
+        return None
+    return json.dumps({
+        "error": f"semantic_context is required for a {kind}.",
+        "why": (
+            "The encoder embeds each element from its semantic_context; an element "
+            "with no description produces NaN energies for itself and everything "
+            "within two hops. Provide at least one sentence describing what this "
+            f"{kind} is and how it was verified."
+        ),
+    })
+
+
 _delta = ObservationDelta()
 
 # Track which nodes and edges have been read in this session.
@@ -517,6 +540,9 @@ def register(
         gate = _gate_write()
         if gate:
             return gate
+        ctx_err = _require_semantic_context(semantic_context, "node")
+        if ctx_err:
+            return ctx_err
         cache = get_cache()
 
         # Check if node already exists
@@ -585,6 +611,10 @@ def register(
 
         if metadata is None and semantic_context is None and type is None and remove_keys is None:
             return json.dumps({"error": "Provide type, metadata, semantic_context, or remove_keys to edit."})
+        if semantic_context is not None:
+            ctx_err = _require_semantic_context(semantic_context, "node")
+            if ctx_err:
+                return ctx_err
 
         before = cache.update_node_metadata(
             resolved, metadata, semantic_context,
@@ -714,6 +744,9 @@ def register(
         gate = _gate_write()
         if gate:
             return gate
+        ctx_err = _require_semantic_context(semantic_context, "edge")
+        if ctx_err:
+            return ctx_err
         cache = get_cache()
 
         # Check if edge already exists
@@ -797,6 +830,10 @@ def register(
 
         if all(v is None for v in [source, target, metadata, semantic_context, remove_keys]):
             return json.dumps({"error": "Provide source, target, metadata, semantic_context, or remove_keys to edit."})
+        if semantic_context is not None:
+            ctx_err = _require_semantic_context(semantic_context, "edge")
+            if ctx_err:
+                return ctx_err
 
         before = cache.update_edge_metadata(
             name, metadata, semantic_context,

@@ -55,8 +55,10 @@ TOOL_SCOPES: dict[str, str] = {
     "get_branch": "infra:read",
     "get_graph": "infra:read",
     "create_branch": "infra:write",
+    "merge_branch": "infra:write",
     "list_commits": "infra:read",
     "diff_commits": "infra:read",
+    "verify_remediation": "infra:read",
     "search_nodes": "infra:read",
     "infra_stats": "infra:read",
     # Scanning

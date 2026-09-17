@@ -69,6 +69,19 @@ def _db_path(branch_id: str) -> Path:
     return _CACHE_DIR / f"{safe_id}.db"
 
 
+class EncodingInProgress(RuntimeError):
+    """The inference server is still encoding this graph.
+
+    Raised when the energy endpoints time out or return a gateway error.
+    Server-side encoding is not tied to the HTTP request — it keeps running
+    and populates the server's disk cache. Callers should NOT retry the
+    energy endpoints while this is in flight: the inference server does not
+    de-duplicate in-flight encodes, so every retry starts another full
+    MiniLM + encoder pass competing for the same CPU. Wait for encoding to
+    finish (oracle encoding-status), then fetch once.
+    """
+
+
 class EnergyGraphCache:
     """SQLite-backed graph + energy cache.
 
@@ -88,6 +101,7 @@ class EnergyGraphCache:
         self.has_energies: bool = False
         self.energies_incomplete: bool = False
         self.energy_error: str | None = None
+        self.encoding_in_progress: bool = False
         self._n_nodes: int = 0
         self._n_edges: int = 0
         self._n_node_types: int = 0
@@ -212,7 +226,16 @@ class EnergyGraphCache:
         cls,
         branch_id: str,
         http_client: httpx.AsyncClient,
+        fetch_energies: bool = True,
     ) -> "EnergyGraphCache":
+        """Fetch the graph (and, by default, its energies) into a fresh SQLite cache.
+
+        Pass ``fetch_energies=False`` when server-side encoding is known to be
+        still running: the graph is cached so graph tools work, and energies
+        can be merged later with :meth:`refresh_energies` without re-fetching
+        the graph. Calling the energy endpoints mid-encode would start a
+        duplicate encode on the server.
+        """
         cache = cls()
         cache.branch_id = branch_id
 
@@ -242,24 +265,25 @@ class EnergyGraphCache:
         await cache._fetch_graph(branch_id, http_client)
 
         # 2-4. Fetch metadata + energies from JEPA endpoints → overlay onto SQLite
-        try:
-            await cache._fetch_and_merge_energies(
-                branch_id, cache.repository_id, http_client,
-            )
-            # Check if any node actually got energy data
-            row = cache._write_db.execute(
-                "SELECT COUNT(*) FROM nodes WHERE entry_energy IS NOT NULL"
-            ).fetchone()
-            if row[0] > 0:
-                cache.has_energies = True
-            else:
-                cache.energy_error = (
-                    "Energy data returned but no names matched the graph. "
-                    "The inference cache may be stale — retry load_graph_energies."
+        if fetch_energies:
+            try:
+                await cache._fetch_and_merge_energies(
+                    branch_id, cache.repository_id, http_client,
                 )
-        except Exception as exc:
-            cache.energy_error = f"Energy fetch failed: {exc}"
-            log.warning("Energy fetch failed for branch %s: %s", branch_id, exc)
+                cache._recompute_energy_state()
+            except EncodingInProgress as exc:
+                cache.encoding_in_progress = True
+                cache.energy_error = str(exc)
+                log.info("Energies not ready for branch %s: %s", branch_id, exc)
+            except Exception as exc:
+                cache.energy_error = f"Energy fetch failed: {exc}"
+                log.warning("Energy fetch failed for branch %s: %s", branch_id, exc)
+        else:
+            cache.encoding_in_progress = True
+            cache.energy_error = (
+                "Encoding still in progress on the inference server; "
+                "energies were not requested to avoid starting a duplicate encode."
+            )
 
         # Compute stats from the write connection (guaranteed to see all data)
         wdb = cache._write_db
@@ -281,6 +305,70 @@ class EnergyGraphCache:
             cache._n_nodes, cache._n_edges, cache.has_energies, db_file,
         )
         return cache
+
+    # ------------------------------------------------------------------
+    # Energy refresh for an already-cached graph
+    # ------------------------------------------------------------------
+
+    def _recompute_energy_state(self) -> None:
+        """Derive has_energies / energy_error from the rows in the write connection."""
+        row = self._write_db.execute(
+            "SELECT COUNT(*) FROM nodes WHERE entry_energy IS NOT NULL"
+        ).fetchone()
+        if row[0] > 0:
+            self.has_energies = True
+            self.encoding_in_progress = False
+            self.energy_error = None
+        else:
+            self.has_energies = False
+            self.energy_error = (
+                "Energy data returned but no names matched the graph. "
+                "The inference cache may be stale — retry load_graph_energies."
+            )
+
+    async def refresh_energies(self, http_client: httpx.AsyncClient) -> bool:
+        """Fetch energies for the graph already in this cache and merge them in place.
+
+        Used when the graph was cached (from disk or a previous build) but the
+        energy fetch did not complete — typically because server-side encoding
+        was still running. Does not re-download the graph.
+
+        Returns True when the cache has energies afterwards. Raises
+        :class:`EncodingInProgress` if the server is still encoding.
+        """
+        if self._db_path is None or self.branch_id is None:
+            raise RuntimeError("No graph loaded — call load_graph_energies first.")
+
+        if not self.repository_id:
+            resp = await http_client.get(
+                f"/api/infra/branches/{self.branch_id}", timeout=30,
+            )
+            resp.raise_for_status()
+            self.repository_id = resp.json().get("repository_id", "")
+
+        owns_write = self._write_db is None
+        if owns_write:
+            self._write_db = sqlite3.connect(self._db_path, check_same_thread=False)
+            self._write_db.execute("PRAGMA journal_mode=WAL")
+            self._write_db.execute("PRAGMA synchronous=NORMAL")
+        try:
+            await self._fetch_and_merge_energies(
+                self.branch_id, self.repository_id, http_client,
+            )
+            self._recompute_energy_state()
+        except EncodingInProgress as exc:
+            self.encoding_in_progress = True
+            self.energy_error = str(exc)
+            raise
+        finally:
+            if owns_write:
+                self._write_db.close()
+                self._write_db = None
+            # Reopen the shared read connection lazily so it sees the merged rows.
+            if self._read_db is not None:
+                self._read_db.close()
+                self._read_db = None
+        return self.has_energies
 
     # ------------------------------------------------------------------
     # Step 1: Fetch graph → SQLite
@@ -377,11 +465,11 @@ class EnergyGraphCache:
         params = {"branch_id": branch_id, "repository_id": repository_id}
         db = self._write_db
 
-        # Entry energies (triggers encoding if not cached)
-        entry_energies = await self._fetch_entry_energies(params, client, force_refresh=False)
-        if not entry_energies:
-            log.info("Entry energies empty — retrying with force_refresh...")
-            entry_energies = await self._fetch_entry_energies(params, client, force_refresh=True)
+        # Entry energies. On a cold server cache this call triggers encoding;
+        # if the proxy times out first, EncodingInProgress propagates. We never
+        # retry here — and never with force_refresh — because the server has no
+        # in-flight de-duplication: each call would start another full encode.
+        entry_energies = await self._fetch_entry_energies(params, client)
         if not entry_energies:
             raise RuntimeError("batch_entry_energies returned empty.")
 
@@ -452,22 +540,34 @@ class EnergyGraphCache:
         self,
         params: dict,
         client: httpx.AsyncClient,
-        force_refresh: bool = False,
     ) -> list[float]:
+        """POST batch_entry_energies exactly once.
+
+        A gateway timeout (the portal proxies /api/jepa with a 300s read
+        timeout) or a client read timeout means the server is still encoding.
+        That is surfaced as EncodingInProgress rather than retried.
+        """
         try:
             resp = await client.post(
                 "/api/jepa/batch_entry_energies",
                 params=params,
-                json={"force_refresh": force_refresh},
+                json={"force_refresh": False},
                 timeout=600,
             )
             resp.raise_for_status()
             return resp.json().get("energies", [])
-        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.HTTPStatusError) as exc:
-            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code != 504:
-                raise
-            log.info("Entry energies request failed (%s)", exc)
-            return []
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            raise EncodingInProgress(
+                f"batch_entry_energies timed out ({type(exc).__name__}); "
+                "the inference server is still encoding this graph."
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (502, 503, 504):
+                raise EncodingInProgress(
+                    f"batch_entry_energies returned HTTP {exc.response.status_code}; "
+                    "the inference server is still encoding this graph."
+                ) from exc
+            raise
 
     # ------------------------------------------------------------------
     # Write support (used by observation tools)

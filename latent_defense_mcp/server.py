@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import logging
 import sys
 import time
@@ -16,7 +17,7 @@ import httpx
 
 from .auth import DeviceFlowPending
 from .client import get_token_manager, make_client, _base_url as get_base_url, _verify_ssl as get_verify_ssl
-from .energy_cache import EnergyGraphCache
+from .energy_cache import EncodingInProgress, EnergyGraphCache
 from .errors import McpApiError, handle_response
 from .telemetry import emit_mcp_call_event, fire_and_forget
 
@@ -615,20 +616,45 @@ async def get_graph(branch_id: str) -> str:
 
 
 @mcp.tool()
-async def create_branch(repo_id: str, label: str, source_branch_id: str = "") -> str:
+async def create_branch(repo_id: str, label: str, source_branch_id: str = "",
+                        branch_type: str = "") -> str:
     """Create a new branch in a repository.
 
     Args:
         repo_id: Repository ID.
         label: Branch label.
         source_branch_id: Branch to fork from. If empty, forks from the repo's default branch.
+        branch_type: Branch type (e.g. "coordinator" for additive-only merge semantics).
     """
     body: dict[str, Any] = {"label": label}
     if source_branch_id:
         body["source_branch_id"] = source_branch_id
+    if branch_type:
+        body["branch_type"] = branch_type
     return json.dumps(
         await _post(
             f"/api/infra/repositories/{repo_id}/branches", body, _tool="create_branch"
+        )
+    )
+
+
+@mcp.tool()
+async def merge_branch(source_branch_id: str, target_branch_id: str,
+                       message: str = "") -> str:
+    """Merge source branch into target. Coordinator branches suppress removals (additive-only).
+
+    Args:
+        source_branch_id: Branch to merge from.
+        target_branch_id: Branch to merge into.
+        message: Optional merge commit message.
+    """
+    body: dict[str, Any] = {"author": "mcp-orchestrator"}
+    if message:
+        body["message"] = message
+    return json.dumps(
+        await _post(
+            f"/api/infra/branches/{source_branch_id}/merge-into/{target_branch_id}",
+            body, _tool="merge_branch",
         )
     )
 
@@ -1153,6 +1179,162 @@ async def validate_path(path_id: str) -> str:
     return json.dumps(
         await _post(f"/api/triage/paths/{path_id}/validate", _tool="validate_path")
     )
+
+
+@mcp.tool()
+async def verify_remediation(
+    source_branch_id: str,
+    remediation_branch_id: str,
+    path_node_ids: str = "",
+    source_commit_id: str = "",
+    remediation_commit_id: str = "",
+) -> str:
+    """Verify whether a remediation actually cut an attack path by comparing immutable graph snapshots. Does not use tm_match — works on graph-only branches.
+
+    If commit IDs are omitted, resolves each branch head once before materializing
+    its graph. If path_node_ids is provided, checks whether edges along that
+    path were removed. Otherwise compares the full edge sets.
+
+    Args:
+        source_branch_id: Branch before remediation.
+        remediation_branch_id: Branch after remediation.
+        path_node_ids: Optional comma-separated node IDs forming the attack path to verify.
+        source_commit_id: Optional immutable source snapshot. Defaults to the source branch's current head.
+        remediation_commit_id: Optional immutable remediation snapshot. Defaults to the remediation branch's current head.
+    """
+    async def _resolve_head(branch_id: str, supplied_commit_id: str, label: str) -> str:
+        if supplied_commit_id.strip():
+            return supplied_commit_id.strip()
+        commits = await _get(
+            f"/api/infra/branches/{branch_id}/commits",
+            _tool="verify_remediation",
+            limit=1,
+        )
+        if not isinstance(commits, list) or not commits:
+            raise ValueError(f"{label} branch has no commits to compare.")
+        commit_id = commits[0].get("commit_id") if isinstance(commits[0], dict) else None
+        if not isinstance(commit_id, str) or not commit_id:
+            raise ValueError(f"{label} branch head did not include a commit_id.")
+        return commit_id
+
+    # --- Resolve both branch heads before reading either graph ---
+    try:
+        source_commit_id = await _resolve_head(
+            source_branch_id, source_commit_id, "Source"
+        )
+    except McpApiError as e:
+        return json.dumps({"error": f"Failed to resolve source branch head: {e}", "status": e.status})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    try:
+        remediation_commit_id = await _resolve_head(
+            remediation_branch_id, remediation_commit_id, "Remediation"
+        )
+    except McpApiError as e:
+        return json.dumps({"error": f"Failed to resolve remediation branch head: {e}", "status": e.status})
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+
+    snapshot = {
+        "source_commit_id": source_commit_id,
+        "remediation_commit_id": remediation_commit_id,
+    }
+
+    # --- Materialize the immutable snapshots ---
+    try:
+        source_graph = await _get(
+            f"/api/infra/commits/{source_commit_id}/graph",
+            _tool="verify_remediation",
+        )
+    except McpApiError as e:
+        return json.dumps({"error": f"Failed to fetch source commit: {e}", "status": e.status, **snapshot})
+
+    try:
+        remediation_graph = await _get(
+            f"/api/infra/commits/{remediation_commit_id}/graph",
+            _tool="verify_remediation",
+        )
+    except McpApiError as e:
+        return json.dumps({"error": f"Failed to fetch remediation commit: {e}", "status": e.status, **snapshot})
+
+    # --- Extract edges as (source, target) sets ---
+    def _extract_edges(graph: dict) -> set[tuple[str, str]]:
+        raw = graph.get("edges", {})
+        items = raw.values() if isinstance(raw, dict) else raw
+        edges: set[tuple[str, str]] = set()
+        for e in items:
+            src = e.get("source", "")
+            tgt = e.get("target", "")
+            if src and tgt:
+                edges.add((src, tgt))
+        return edges
+
+    def _node_count(graph: dict) -> int:
+        raw = graph.get("nodes", {})
+        return len(raw) if isinstance(raw, (dict, list)) else 0
+
+    source_edges = _extract_edges(source_graph)
+    remediation_edges = _extract_edges(remediation_graph)
+    source_node_count = _node_count(source_graph)
+    remediation_node_count = _node_count(remediation_graph)
+
+    # --- Graph collapse check ---
+    if source_node_count > 0 and remediation_node_count < source_node_count * 0.5:
+        return json.dumps({
+            "verdict": "unscorable",
+            "reason": "Remediation graph has <50% of source graph nodes — likely graph collapse.",
+            **snapshot,
+            "node_count_source": source_node_count,
+            "node_count_remediation": remediation_node_count,
+            "source_edge_count": len(source_edges),
+            "remediation_edge_count": len(remediation_edges),
+        })
+
+    # --- Path-specific check ---
+    if path_node_ids.strip():
+        node_ids = [n.strip() for n in path_node_ids.split(",") if n.strip()]
+        if len(node_ids) < 2:
+            return json.dumps({"error": "path_node_ids must contain at least 2 node IDs."})
+
+        edges_cut: list[list[str]] = []
+        edges_surviving: list[list[str]] = []
+
+        for i in range(len(node_ids) - 1):
+            pair = (node_ids[i], node_ids[i + 1])
+            if pair in source_edges and pair not in remediation_edges:
+                edges_cut.append(list(pair))
+            elif pair in source_edges and pair in remediation_edges:
+                edges_surviving.append(list(pair))
+            # If the pair wasn't in source_edges at all, skip — not a real path edge
+
+        verdict = "cut" if edges_cut else "no_cut"
+
+        return json.dumps({
+            "verdict": verdict,
+            **snapshot,
+            "source_edge_count": len(source_edges),
+            "remediation_edge_count": len(remediation_edges),
+            "edges_cut": edges_cut,
+            "edges_surviving": edges_surviving,
+            "node_count_source": source_node_count,
+            "node_count_remediation": remediation_node_count,
+        })
+
+    # --- Full edge diff (no path specified) ---
+    cut = source_edges - remediation_edges
+    added = remediation_edges - source_edges
+
+    return json.dumps({
+        "verdict": "structural_diff",
+        **snapshot,
+        "source_edge_count": len(source_edges),
+        "remediation_edge_count": len(remediation_edges),
+        "edges_cut": [list(e) for e in sorted(cut)],
+        "edges_added": [list(e) for e in sorted(added)],
+        "node_count_source": source_node_count,
+        "node_count_remediation": remediation_node_count,
+    })
 
 
 @mcp.tool()
@@ -2377,6 +2559,26 @@ async def load_branch(branch_id: str) -> str:
             timeout=30,
         )
         if r.is_success:
+            body = r.json()
+            payload = body.get("result", body)
+            # A 2xx does not mean the graph is ready: the oracle returns
+            # {"status": "encoding_started"} when it kicked off a fresh encode
+            # and will finish in the background. Only a payload that does not
+            # say so (a cache hit returns the graph summary) counts as loaded.
+            if isinstance(payload, dict) and payload.get("status") == "encoding_started":
+                _start_keepalive()
+                return json.dumps(
+                    {
+                        "status": "encoding_started",
+                        "branch_id": branch_id,
+                        "result": payload,
+                        "message": (
+                            "Graph loading started on the inference server. "
+                            "Call wait_for_load() to block until encoding completes; "
+                            "load_graph_energies handles waiting automatically."
+                        ),
+                    }
+                )
             _graph_loaded = True
             _encoding_started_at = None
             _start_keepalive()
@@ -2384,7 +2586,7 @@ async def load_branch(branch_id: str) -> str:
                 {
                     "status": "loaded",
                     "branch_id": branch_id,
-                    "result": r.json().get("result", r.json()),
+                    "result": payload,
                 }
             )
     except (httpx.TimeoutException, httpx.ConnectError):
@@ -2482,11 +2684,26 @@ async def wait_for_load(timeout_secs: int = 600, poll_interval: int = 30) -> str
 
     deadline = time.time() + timeout_secs
     while time.time() < deadline:
-        probe = await _probe_oracle_graph_loaded(expected_branch=_load_branch_id)
-        if probe is not None:
-            _graph_loaded = True
+        # Ask the encoder first. The session probe below reports whatever graph
+        # the session currently serves — during a re-encode of the same branch
+        # (e.g. after commit_graph) that is the PREVIOUS revision, so the probe
+        # alone would return "loaded" while the new encode is still running.
+        progress = await _fetch_encoding_progress()
+        stage = progress.get("stage") if progress else None
+        if stage == 9:
             _encoding_started_at = None
-            return json.dumps({"status": "loaded", "result": probe})
+            return json.dumps({
+                "status": "failed",
+                "error": progress.get("error"),
+                "message": "Encoding failed on the inference server.",
+            })
+        encoding_active = stage is not None and stage != 8
+        if not encoding_active:
+            probe = await _probe_oracle_graph_loaded(expected_branch=_load_branch_id)
+            if probe is not None:
+                _graph_loaded = True
+                _encoding_started_at = None
+                return json.dumps({"status": "loaded", "result": probe})
 
         if _oracle_session is None:
             branch = _load_branch_id
@@ -3295,6 +3512,70 @@ def _stop_jepa_keepalive():
         _jepa_keepalive_task = None
 
 
+# How long load_graph_energies waits for server-side encoding before giving the
+# graph back without energies. Large graphs (10k+ nodes) on a CPU-only inference
+# pod can take 10-15 minutes for a cold encode.
+_ENCODE_WAIT_SECS = int(os.environ.get("LATENT_DEFENSE_ENCODE_WAIT_SECS", "900"))
+
+
+async def _await_encoding(branch_id: str) -> tuple[bool | None, dict | None]:
+    """Trigger server-side encoding via the oracle session and wait for it.
+
+    Returns ``(ready, progress)``:
+      * ``(True, None)``  — the server reports the graph encoded; energy
+        endpoints will hit the server cache and return quickly.
+      * ``(False, progress)`` — still encoding after the wait budget. Callers
+        must NOT hit the energy endpoints: the inference server does not
+        de-duplicate in-flight encodes, so each call would start another one.
+      * ``(None, None)`` — warm-up path unavailable (e.g. oracle error). The
+        caller may try the energy endpoints once, as before.
+    """
+    try:
+        load_result = json.loads(await load_branch(branch_id))
+        if load_result.get("status") == "loaded":
+            return True, None
+        log.info("load_graph_energies: encoding in progress, waiting up to %ds", _ENCODE_WAIT_SECS)
+        wait_result = json.loads(
+            await wait_for_load(timeout_secs=_ENCODE_WAIT_SECS, poll_interval=15)
+        )
+        if wait_result.get("status") == "loaded":
+            log.info("load_graph_energies: JEPA encoding complete")
+            return True, None
+        progress = None
+        try:
+            progress = json.loads(await _format_encoding_progress())
+        except Exception:  # progress is best-effort
+            pass
+        log.warning("load_graph_energies: encoding still running after %ds", _ENCODE_WAIT_SECS)
+        return False, progress
+    except Exception as exc:
+        log.warning("load_graph_energies: JEPA warm-up failed (%s), proceeding with graph fetch", exc)
+        return None, None
+
+
+def _energy_status_fields(cache: EnergyGraphCache, progress: dict | None) -> dict[str, Any]:
+    """Result fields describing why a cache has no energies and what to do next."""
+    fields: dict[str, Any] = {
+        "status": "loaded_without_energies",
+        "energy_error": cache.energy_error,
+    }
+    if cache.encoding_in_progress:
+        fields["encoding"] = progress or {"status": "encoding"}
+        fields["next_step"] = (
+            "Graph tools (read_node, grep_nodes, find_nodes_by_type, etc.) work now. "
+            "The inference server is still encoding this graph. Call "
+            "load_graph_energies(branch_id) again — WITHOUT force_refresh — once it "
+            "finishes; the energies will be merged into this cache without "
+            "re-downloading the graph. Do not call energy endpoints in the meantime."
+        )
+    else:
+        fields["next_step"] = (
+            "Graph tools work. Energy tools require energy scores — call "
+            "load_graph_energies(branch_id) again to retry the energy fetch."
+        )
+    return fields
+
+
 @mcp.tool()
 async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> str:
     """Load an infrastructure graph with energy scores into the local cache.
@@ -3313,7 +3594,9 @@ async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> st
         branch_id: Branch to load.
         force_refresh: Delete the local cache and re-fetch from the server.
             Use after commit_graph() to get fresh JEPA energy scores for
-            newly added or modified nodes and edges.
+            newly added or modified nodes and edges. NOT needed when a
+            previous load returned ``loaded_without_energies`` — a plain
+            call completes the energy fetch in place.
     """
     global _energy_cache
 
@@ -3340,10 +3623,36 @@ async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> st
         if _energy_cache is not None:
             _energy_cache.close()
         _energy_cache = cached
-        if cached.has_energies and cached.repository_id:
-            _start_jepa_keepalive(branch_id, cached.repository_id)
         # Restore persisted delta from previous session (if any)
         pending = observation_tools.load_delta_from_disk(branch_id)
+
+        progress: dict | None = None
+        if not cached.has_energies:
+            # The graph is cached but a previous energy fetch never completed
+            # (typically: server-side encoding outlived the proxy timeout).
+            # Finish the job in place instead of handing back a stale
+            # "no energies" cache and telling the caller to retry.
+            ready, progress = await _await_encoding(branch_id)
+            if ready is not False:
+                try:
+                    client = await _http()
+                    await cached.refresh_energies(client)
+                except DeviceFlowPending as e:
+                    return json.dumps(_auth_pending_response(e))
+                except EncodingInProgress:
+                    pass  # state recorded on the cache
+                except Exception as exc:
+                    cached.energy_error = f"Energy fetch failed: {exc}"
+                    log.warning("Energy refresh failed for branch %s: %s", branch_id, exc)
+            else:
+                cached.encoding_in_progress = True
+                cached.energy_error = (
+                    f"Encoding still in progress after {_ENCODE_WAIT_SECS}s; "
+                    "energies not fetched to avoid a duplicate encode."
+                )
+
+        if cached.has_energies and cached.repository_id:
+            _start_jepa_keepalive(branch_id, cached.repository_id)
 
         result = {
             "status": "loaded",
@@ -3357,6 +3666,8 @@ async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> st
             "commit_id": cached.commit_id,
             "has_energies": cached.has_energies,
         }
+        if not cached.has_energies:
+            result.update(_energy_status_fields(cached, progress))
         if pending:
             result["pending_changes"] = pending
             result["pending_note"] = (
@@ -3371,26 +3682,13 @@ async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> st
         return json.dumps(_auth_pending_response(e))
 
     # --- JEPA warm-up: trigger encoding and wait for completion ---
-    # This replaces the old load_branch + wait_for_load sequence.
-    # The inference session is used internally to trigger and poll encoding.
-    try:
-        log.info("load_graph_energies: triggering JEPA warm-up for branch %s", branch_id)
-        load_result = await load_branch(branch_id)
-        load_data = json.loads(load_result)
-
-        if load_data.get("status") != "loaded":
-            # Encoding started but not instant — poll until ready
-            log.info("load_graph_energies: encoding in progress, waiting...")
-            wait_result = await wait_for_load(timeout_secs=600, poll_interval=15)
-            wait_data = json.loads(wait_result)
-            if wait_data.get("status") == "timeout":
-                log.warning("load_graph_energies: JEPA warm-up timed out, proceeding anyway")
-            elif wait_data.get("status") == "loaded":
-                log.info("load_graph_energies: JEPA encoding complete")
-    except Exception as exc:
-        # JEPA warm-up failure is non-fatal — we still try to fetch the graph
-        # and energies. The energy fetch may fail too, but graph tools will work.
-        log.warning("load_graph_energies: JEPA warm-up failed (%s), proceeding with graph fetch", exc)
+    # The oracle session triggers exactly one server-side encode and lets us
+    # poll its progress without touching the energy endpoints. If it is still
+    # running when the wait budget expires we fetch the graph only — hitting
+    # batch_entry_energies mid-encode would start a duplicate encode.
+    log.info("load_graph_energies: triggering JEPA warm-up for branch %s", branch_id)
+    ready, progress = await _await_encoding(branch_id)
+    fetch_energies = ready is not False
 
     # --- Fetch graph + energies into local cache ---
     # Re-acquire the client — the JEPA warm-up above may have recreated it
@@ -3401,13 +3699,15 @@ async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> st
         return json.dumps(_auth_pending_response(e))
 
     try:
-        cache = await EnergyGraphCache.build(branch_id, client)
+        cache = await EnergyGraphCache.build(branch_id, client, fetch_energies=fetch_energies)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 401:
             refreshed = await _refresh_client()
             if refreshed is not None:
                 try:
-                    cache = await EnergyGraphCache.build(branch_id, refreshed)
+                    cache = await EnergyGraphCache.build(
+                        branch_id, refreshed, fetch_energies=fetch_energies,
+                    )
                 except Exception as retry_err:
                     return json.dumps({
                         "error": "load_failed",
@@ -3452,13 +3752,7 @@ async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> st
         "has_energies": cache.has_energies,
     }
     if not cache.has_energies:
-        result["status"] = "loaded_without_energies"
-        result["energy_error"] = cache.energy_error
-        result["next_step"] = (
-            "Graph tools (read_node, grep_nodes, find_nodes_by_type, etc.) work. "
-            "Energy tools require energy scores — retry "
-            "load_graph_energies(branch_id) in a few minutes."
-        )
+        result.update(_energy_status_fields(cache, progress))
     if cache.energies_incomplete:
         result["warning"] = (
             "Transition energy data is incomplete — the SSE stream closed "
