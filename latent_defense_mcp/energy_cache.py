@@ -82,6 +82,80 @@ class EncodingInProgress(RuntimeError):
     """
 
 
+class EncodingBusy(EncodingInProgress):
+    """The inference server rejected the request because its encoder is busy (HTTP 503).
+
+    Not retried automatically; callers wait on the encoding-status endpoint.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        in_flight_branch: str | None = None,
+        same_branch: bool | None = None,
+        progress_pct: float | int | None = None,
+        retry_after: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.in_flight_branch = in_flight_branch
+        self.same_branch = same_branch
+        self.progress_pct = progress_pct
+        self.retry_after = retry_after
+
+
+def _parse_busy(resp: httpx.Response, label: str) -> EncodingBusy | None:
+    """Return EncodingBusy if ``resp`` is a 503 whose JSON body says ``status: busy``."""
+    if resp.status_code != 503:
+        return None
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict) or body.get("status") != "busy":
+        return None
+    in_flight = body.get("in_flight")
+    if not isinstance(in_flight, dict):
+        in_flight = {}
+    retry_after: int | None = None
+    raw = resp.headers.get("Retry-After", body.get("retry_after"))
+    try:
+        retry_after = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        retry_after = None
+    branch = in_flight.get("branch_id")
+    pct = in_flight.get("progress_pct", body.get("progress_pct"))
+    same = body.get("same_branch")
+    detail = f" ({branch}, {pct}% done)" if branch and pct is not None else ""
+    return EncodingBusy(
+        f"{label}: the inference encoder is busy with another encode{detail}; "
+        "not starting a second one.",
+        in_flight_branch=branch,
+        same_branch=same if isinstance(same, bool) else None,
+        progress_pct=pct,
+        retry_after=retry_after,
+    )
+
+
+def _raise_for_encode_status(resp: httpx.Response, label: str) -> None:
+    """``raise_for_status`` with encode semantics.
+
+    503 ``status: busy`` -> EncodingBusy; any other 502/503/504 -> EncodingInProgress;
+    everything else follows ``raise_for_status``. Never retries.
+    """
+    if resp.is_success:
+        return
+    busy = _parse_busy(resp, label)
+    if busy is not None:
+        raise busy
+    if resp.status_code in (502, 503, 504):
+        raise EncodingInProgress(
+            f"{label} returned HTTP {resp.status_code}; "
+            "the inference server is still encoding this graph."
+        )
+    resp.raise_for_status()
+
+
 class EnergyGraphCache:
     """SQLite-backed graph + energy cache.
 
@@ -102,6 +176,8 @@ class EnergyGraphCache:
         self.energies_incomplete: bool = False
         self.energy_error: str | None = None
         self.encoding_in_progress: bool = False
+        # Set when the server rejected an energy call with 503 status=busy.
+        self.busy: EncodingBusy | None = None
         self._n_nodes: int = 0
         self._n_edges: int = 0
         self._n_node_types: int = 0
@@ -273,6 +349,7 @@ class EnergyGraphCache:
                 cache._recompute_energy_state()
             except EncodingInProgress as exc:
                 cache.encoding_in_progress = True
+                cache.busy = exc if isinstance(exc, EncodingBusy) else None
                 cache.energy_error = str(exc)
                 log.info("Energies not ready for branch %s: %s", branch_id, exc)
             except Exception as exc:
@@ -318,6 +395,7 @@ class EnergyGraphCache:
         if row[0] > 0:
             self.has_energies = True
             self.encoding_in_progress = False
+            self.busy = None
             self.energy_error = None
         else:
             self.has_energies = False
@@ -358,6 +436,7 @@ class EnergyGraphCache:
             self._recompute_energy_state()
         except EncodingInProgress as exc:
             self.encoding_in_progress = True
+            self.busy = exc if isinstance(exc, EncodingBusy) else None
             self.energy_error = str(exc)
             raise
         finally:
@@ -474,10 +553,16 @@ class EnergyGraphCache:
             raise RuntimeError("batch_entry_energies returned empty.")
 
         # Metadata
-        meta_resp = await client.post(
-            "/api/jepa/graph_metadata", params=params, json={}, timeout=120,
-        )
-        meta_resp.raise_for_status()
+        try:
+            meta_resp = await client.post(
+                "/api/jepa/graph_metadata", params=params, json={}, timeout=120,
+            )
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            raise EncodingInProgress(
+                f"graph_metadata timed out ({type(exc).__name__}); "
+                "the inference server is still encoding this graph."
+            ) from exc
+        _raise_for_encode_status(meta_resp, "graph_metadata")
         meta = meta_resp.json()
         node_ids: list[str] = meta.get("node_ids", [])
         edge_ids: list[str] = meta.get("edge_ids", [])
@@ -486,19 +571,27 @@ class EnergyGraphCache:
 
         # Transition energies (SSE)
         transition_energies: list[float] = []
-        async with client.stream(
-            "POST", "/api/jepa/batch_transition_energies",
-            params=params, json={}, timeout=600,
-        ) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                event = json.loads(line[5:].strip())
-                if event["type"] == "complete":
-                    transition_energies = event["result"]["energies"]
-                elif event["type"] == "error":
-                    raise RuntimeError(f"Transition energy error: {event['message']}")
+        try:
+            async with client.stream(
+                "POST", "/api/jepa/batch_transition_energies",
+                params=params, json={}, timeout=600,
+            ) as resp:
+                if not resp.is_success:
+                    await resp.aread()  # the busy body must be read before parsing
+                _raise_for_encode_status(resp, "batch_transition_energies")
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    event = json.loads(line[5:].strip())
+                    if event["type"] == "complete":
+                        transition_energies = event["result"]["energies"]
+                    elif event["type"] == "error":
+                        raise RuntimeError(f"Transition energy error: {event['message']}")
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            raise EncodingInProgress(
+                f"batch_transition_energies timed out ({type(exc).__name__}); "
+                "the inference server is still encoding this graph."
+            ) from exc
 
         if len(edge_ids) > 0 and not transition_energies:
             self.energies_incomplete = True
@@ -554,20 +647,13 @@ class EnergyGraphCache:
                 json={"force_refresh": False},
                 timeout=600,
             )
-            resp.raise_for_status()
-            return resp.json().get("energies", [])
         except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
             raise EncodingInProgress(
                 f"batch_entry_energies timed out ({type(exc).__name__}); "
                 "the inference server is still encoding this graph."
             ) from exc
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in (502, 503, 504):
-                raise EncodingInProgress(
-                    f"batch_entry_energies returned HTTP {exc.response.status_code}; "
-                    "the inference server is still encoding this graph."
-                ) from exc
-            raise
+        _raise_for_encode_status(resp, "batch_entry_energies")
+        return resp.json().get("energies", [])
 
     # ------------------------------------------------------------------
     # Write support (used by observation tools)

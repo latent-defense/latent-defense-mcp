@@ -195,7 +195,7 @@ Eight agentic prompts expand into structured instructions for the calling agent:
 
 `load_graph_energies(branch_id)` is the single entry point for all graph exploration and energy analysis. It fetches the full graph and energy scores from the inference server into a local SQLite database (`~/.latent-defense/graph-cache/<branch>.db`). All graph read/search and energy analysis tools require this to be called first.
 
-For large graphs (1000+ nodes), `load_graph_energies` handles JEPA warm-up internally. The SQLite cache survives process restarts — subsequent loads are instant.
+For large graphs (1000+ nodes), `load_graph_energies` handles JEPA warm-up internally. The inference server runs one encode at a time. If it is busy with the same graph, `load_graph_energies` waits up to `LATENT_DEFENSE_ENCODE_WAIT_SECS` (default 900); otherwise the graph loads without energies (`status: loaded_without_energies`, with an `encoder` object describing the state) and the call can be repeated later without `force_refresh`. The SQLite cache survives process restarts — subsequent loads are instant.
 
 ### Tool tiers
 

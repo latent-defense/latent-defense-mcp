@@ -923,30 +923,54 @@ async def get_inference_run(run_id: str) -> str:
 @mcp.tool()
 async def ingest_detection(
     source: str,
-    severity: str,
-    affected_resource_type: str,
-    affected_resource_id: str,
+    severity: str = "",
+    affected_resource_type: str = "",
+    affected_resource_id: str = "",
     title: str = "",
     cve: str = "",
+    raw_payload: dict[str, Any] | None = None,
 ) -> str:
     """Ingest a security detection from an external tool (scanner, SIEM, etc.).
 
+    Two invocation modes:
+
+    1. **Raw payload** — pass ``source`` and ``raw_payload`` (the full webhook
+       JSON).  The server-side parser extracts severity, resource, CVE, and all
+       metadata (CWE, CVSS, reporter, bounty) automatically.
+
+    2. **Legacy fields** — pass ``source``, ``severity``,
+       ``affected_resource_type``, and ``affected_resource_id``.  Metadata the
+       individual parameters cannot carry is lost.
+
+    At least one mode must be satisfied.  When both are provided, ``raw_payload``
+    is forwarded alongside the explicit fields (the server-side parser takes
+    precedence for any overlapping extraction).
+
     Args:
-        source: Detection source (e.g. "vulnerability_scanner", "config_audit").
-        severity: One of "critical", "high", "medium", "low", "info".
-        affected_resource_type: Resource type (e.g. "ec2_instance", "pod").
-        affected_resource_id: Resource identifier.
+        source: Detection source (e.g. "hackerone", "vulnerability_scanner").
+        severity: One of "critical", "high", "medium", "low", "info". Required unless raw_payload is provided.
+        affected_resource_type: Resource type (e.g. "ec2_instance", "pod", "url"). Required unless raw_payload is provided.
+        affected_resource_id: Resource identifier. Required unless raw_payload is provided.
         title: Detection title.
         cve: CVE identifier if applicable.
+        raw_payload: Full webhook payload from the source.
     """
-    body: dict[str, Any] = {
-        "source": source,
-        "severity": severity,
-        "affected_resource": {
+    has_legacy = bool(severity and affected_resource_type and affected_resource_id)
+    has_raw = raw_payload is not None and len(raw_payload) > 0
+    if not has_legacy and not has_raw:
+        return json.dumps({
+            "error": "Provide either raw_payload (full webhook JSON) or "
+                     "severity + affected_resource_type + affected_resource_id."
+        })
+    body: dict[str, Any] = {"source": source}
+    if has_raw:
+        body["raw_payload"] = raw_payload
+    elif has_legacy:
+        body["severity"] = severity
+        body["affected_resource"] = {
             "type": affected_resource_type,
             "identifier": affected_resource_id,
-        },
-    }
+        }
     if title:
         body["title"] = title
     if cve:
@@ -2524,6 +2548,12 @@ async def load_branch(branch_id: str) -> str:
     encoding completes, then load_graph_energies() to fetch the energy scores
     into the local cache.
 
+    The inference server runs one encode at a time. If another encode is
+    already running, this load is rejected (not queued): the rejection shows
+    up as a failed encoding status with a ``busy`` flag, which wait_for_load()
+    reports. load_graph_energies() waits for that other encode to finish and
+    then loads; this tool alone does not.
+
     Quick path: load_graph_energies(branch_id) handles load_branch +
     wait_for_load + energy fetch in one call. Use the separate tools when
     you need progress visibility during encoding (e.g., in workflows).
@@ -2661,6 +2691,13 @@ async def wait_for_load(timeout_secs: int = 600, poll_interval: int = 30) -> str
     progress at each poll interval. Returns when the graph is ready for
     energy analysis.
 
+    Returns ``status: failed`` if the encode failed. When the encode was
+    rejected because the server's encoder is busy with another graph or run,
+    the result also carries ``busy: true``, ``same_branch`` and ``in_flight``
+    (the running encode's branch and progress); this tool does not wait for
+    that other encode. It returns ``status: timeout`` if nothing finished in
+    ``timeout_secs``.
+
     Quick path: load_graph_energies(branch_id) handles load_branch +
     wait_for_load + energy fetch in one call. Use the separate tools when
     you need progress visibility during encoding (e.g., in workflows).
@@ -2692,11 +2729,23 @@ async def wait_for_load(timeout_secs: int = 600, poll_interval: int = 30) -> str
         stage = progress.get("stage") if progress else None
         if stage == 9:
             _encoding_started_at = None
-            return json.dumps({
+            failed: dict[str, Any] = {
                 "status": "failed",
                 "error": progress.get("error"),
                 "message": "Encoding failed on the inference server.",
-            })
+            }
+            # Pass busy details on so callers can wait instead of reporting a failure.
+            if progress.get("busy") or str(progress.get("error") or "").startswith("busy:"):
+                failed["busy"] = True
+                failed["message"] = (
+                    "The inference encoder is busy with another encode; "
+                    "this load was rejected, not started."
+                )
+                if "same_branch" in progress:
+                    failed["same_branch"] = progress.get("same_branch")
+                if progress.get("in_flight") is not None:
+                    failed["in_flight"] = progress.get("in_flight")
+            return json.dumps(failed)
         encoding_active = stage is not None and stage != 8
         if not encoding_active:
             probe = await _probe_oracle_graph_loaded(expected_branch=_load_branch_id)
@@ -2721,8 +2770,8 @@ async def wait_for_load(timeout_secs: int = 600, poll_interval: int = 30) -> str
                     },
                     timeout=30,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("wait_for_load: session load_branch for %s failed: %s", branch, exc)
 
         remaining = int(deadline - time.time())
         elapsed = int(time.time() - _encoding_started_at) if _encoding_started_at else 0
@@ -3518,17 +3567,93 @@ def _stop_jepa_keepalive():
 _ENCODE_WAIT_SECS = int(os.environ.get("LATENT_DEFENSE_ENCODE_WAIT_SECS", "900"))
 
 
+class RouteEncodeFailed(RuntimeError):
+    """The server reports the encode for this branch failed (encoding-status ``failed``)."""
+
+
+async def wait_for_route_encode(
+    branch_id: str, timeout: float, poll_interval: float = 15,
+) -> dict[str, Any]:
+    """Poll ``/api/jepa/encoding-status`` until an encode this client did not start ends.
+
+    Returns a dict whose ``state`` is ``cached``, ``idle``, ``unsupported`` (older
+    server) or ``timeout``. Raises :class:`RouteEncodeFailed` if the encode failed.
+    """
+    deadline = time.time() + timeout
+    last: dict[str, Any] = {}
+    while True:
+        try:
+            client = await _http()
+            resp = await client.get(
+                "/api/jepa/encoding-status", params={"branch_id": branch_id}, timeout=15,
+            )
+            if resp.status_code in (401, 403, 404, 405):
+                # Older server without the endpoint, or not permitted to poll.
+                return {"state": "unsupported", "http_status": resp.status_code}
+            if resp.status_code == 200:
+                body = resp.json()
+                if isinstance(body, dict):
+                    last = body
+                    state = body.get("state")
+                    if state == "cached":
+                        return dict(body)
+                    if state == "idle":
+                        return dict(body)
+                    if state == "failed":
+                        raise RouteEncodeFailed(str(body.get("error") or "encode failed"))
+            else:
+                log.warning("jepa encoding-status returned %d", resp.status_code)
+        except (RouteEncodeFailed, DeviceFlowPending):
+            raise
+        except Exception as exc:  # transient; keep waiting until the deadline
+            log.warning("jepa encoding-status fetch failed: %s", exc)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return {**last, "state": "timeout"}
+        await asyncio.sleep(min(poll_interval, max(remaining, 0.1)))
+
+
+def _busy_progress(wait_result: dict, branch_id: str, **extra: Any) -> dict[str, Any]:
+    """Build the ``progress`` dict for a rejected-because-busy load."""
+    in_flight = wait_result.get("in_flight")
+    if not isinstance(in_flight, dict):
+        in_flight = {}
+    in_flight_branch = in_flight.get("branch_id")
+    same = wait_result.get("same_branch")
+    if not isinstance(same, bool):
+        same = (in_flight_branch == branch_id) if in_flight_branch else True
+    info: dict[str, Any] = {
+        "status": "busy",
+        "busy": True,
+        "same_branch": same,
+        "in_flight_branch": in_flight_branch,
+        "progress_pct": in_flight.get("progress_pct"),
+        "elapsed_secs": in_flight.get("elapsed_secs"),
+        "error": wait_result.get("error"),
+    }
+    info.update(extra)
+    return info
+
+
 async def _await_encoding(branch_id: str) -> tuple[bool | None, dict | None]:
     """Trigger server-side encoding via the oracle session and wait for it.
 
     Returns ``(ready, progress)``:
       * ``(True, None)``  — the server reports the graph encoded; energy
         endpoints will hit the server cache and return quickly.
-      * ``(False, progress)`` — still encoding after the wait budget. Callers
-        must NOT hit the energy endpoints: the inference server does not
-        de-duplicate in-flight encodes, so each call would start another one.
+      * ``(False, progress)`` — not ready; callers must NOT hit the energy
+        endpoints (each call could start another encode). ``progress`` says
+        why via ``status``: ``busy`` (the server's single encoder is running
+        another encode: ``same_branch``, ``in_flight_branch``,
+        ``progress_pct``), ``failed`` (``error`` from the
+        server), or the ordinary in-progress dict after the wait budget.
       * ``(None, None)`` — warm-up path unavailable (e.g. oracle error). The
         caller may try the energy endpoints once, as before.
+
+    A load rejected because the encoder is busy with the SAME branch (for
+    example the trigger's warm-up after a map) is waited out through the
+    route-level encoding-status endpoint, then loaded again from the server's
+    cache. A rejection for a different branch returns immediately.
     """
     try:
         load_result = json.loads(await load_branch(branch_id))
@@ -3541,6 +3666,52 @@ async def _await_encoding(branch_id: str) -> tuple[bool | None, dict | None]:
         if wait_result.get("status") == "loaded":
             log.info("load_graph_energies: JEPA encoding complete")
             return True, None
+        if wait_result.get("status") == "failed":
+            if not wait_result.get("busy"):
+                error = wait_result.get("error")
+                log.warning("load_graph_energies: encoding failed on the server: %s", error)
+                return False, {
+                    "status": "failed",
+                    "error": error,
+                    "message": "Encoding failed on the inference server.",
+                }
+            busy = _busy_progress(wait_result, branch_id)
+            if busy["same_branch"] is False:
+                log.warning(
+                    "load_graph_energies: encoder busy with %s; not waiting",
+                    busy["in_flight_branch"],
+                )
+                return False, busy
+            # Same branch: wait for the running encode, then load from the cache.
+            try:
+                route = await wait_for_route_encode(
+                    branch_id, _ENCODE_WAIT_SECS, poll_interval=15,
+                )
+            except RouteEncodeFailed as exc:
+                return False, {
+                    "status": "failed",
+                    "error": str(exc),
+                    "message": "The encode this load was waiting on failed.",
+                }
+            state = route.get("state")
+            if state in ("cached", "idle"):
+                retry = json.loads(await load_branch(branch_id))
+                if retry.get("status") == "loaded":
+                    return True, None
+                # The other encode left no usable cache; a new one was started.
+                return False, {
+                    "status": "encoding",
+                    "restarted": True,
+                    "message": "The encode this load waited on ended; a new encode was started.",
+                }
+            if state == "timeout":
+                pct = route.get("progress_pct")
+                if pct is not None:
+                    busy["progress_pct"] = pct
+                busy["waited_secs"] = _ENCODE_WAIT_SECS
+                return False, busy
+            # unsupported (older server without encoding-status)
+            return False, busy
         progress = None
         try:
             progress = json.loads(await _format_encoding_progress())
@@ -3553,13 +3724,115 @@ async def _await_encoding(branch_id: str) -> tuple[bool | None, dict | None]:
         return None, None
 
 
+_DEFAULT_BUSY_RETRY_SECS = 30
+
+
+def _encode_wait_error(progress: dict | None) -> str:
+    """Describe why energies were not fetched, from what actually happened."""
+    status = (progress or {}).get("status")
+    if status == "failed":
+        return f"Encoding failed on the inference server: {progress.get('error') or 'unknown error'}"
+    if status == "busy":
+        return _busy_message(progress)
+    if (progress or {}).get("restarted"):
+        return (
+            "The encode this call waited on ended without a usable result, so a new "
+            "encode was started; energies were not fetched to avoid a duplicate encode."
+        )
+    return (
+        f"Encoding still in progress after {_ENCODE_WAIT_SECS}s; "
+        "energies not fetched to avoid a duplicate encode."
+    )
+
+
+def _busy_message(info: dict) -> str:
+    branch = info.get("in_flight_branch")
+    pct = info.get("progress_pct")
+    if info.get("same_branch") is False:
+        what = f"another graph ({branch})" if branch else "another graph"
+    else:
+        what = f"this graph ({branch})" if branch else "this graph"
+    tail = f", {pct}% done" if pct is not None else ""
+    return (
+        f"The inference encoder is busy encoding {what}{tail}; it runs one encode "
+        "at a time, so this load was not started and energies were not fetched."
+    )
+
+
+def _encoder_object(cache: EnergyGraphCache, progress: dict | None) -> dict[str, Any] | None:
+    """Structured encoder state for a cache without energies, or None."""
+    status = (progress or {}).get("status")
+    if status == "failed":
+        return {
+            "state": "failed",
+            "in_flight_branch": None,
+            "progress_pct": None,
+            "retry_after_secs": None,
+            "error": progress.get("error"),
+        }
+    busy_exc = getattr(cache, "busy", None)
+    if status == "busy" or busy_exc is not None:
+        if status == "busy":
+            src = progress
+            retry = src.get("retry_after_secs")
+            branch, pct = src.get("in_flight_branch"), src.get("progress_pct")
+        else:
+            retry, branch, pct = busy_exc.retry_after, busy_exc.in_flight_branch, busy_exc.progress_pct
+        return {
+            "state": "busy",
+            "in_flight_branch": branch,
+            "progress_pct": pct,
+            "retry_after_secs": retry if retry is not None else _DEFAULT_BUSY_RETRY_SECS,
+            "error": None,
+        }
+    if cache.encoding_in_progress:
+        p = progress or {}
+        return {
+            "state": "encoding",
+            "in_flight_branch": None,
+            "progress_pct": p.get("progress_pct"),
+            "retry_after_secs": None,
+            "error": None,
+        }
+    return None
+
+
 def _energy_status_fields(cache: EnergyGraphCache, progress: dict | None) -> dict[str, Any]:
     """Result fields describing why a cache has no energies and what to do next."""
     fields: dict[str, Any] = {
         "status": "loaded_without_energies",
         "energy_error": cache.energy_error,
     }
-    if cache.encoding_in_progress:
+    status = (progress or {}).get("status")
+    busy_exc = getattr(cache, "busy", None)
+    encoder = _encoder_object(cache, progress)
+    if encoder is not None:
+        fields["encoder"] = encoder
+    if status == "failed":
+        fields["energy_error"] = _encode_wait_error(progress)
+        fields["encoding"] = progress
+        fields["next_step"] = (
+            "Graph tools work now. The encode failed on the inference server (see "
+            "encoder.error). Call load_graph_energies(branch_id) again to retry; "
+            "force_refresh=true starts an encode too and is rejected while another "
+            "encode is running."
+        )
+    elif status == "busy" or busy_exc is not None:
+        if status == "busy":
+            fields["energy_error"] = _busy_message(progress)
+            fields["encoding"] = progress
+        else:
+            fields["encoding"] = {"status": "busy"}
+        retry = encoder["retry_after_secs"] if encoder else _DEFAULT_BUSY_RETRY_SECS
+        fields["next_step"] = (
+            "Graph tools (read_node, grep_nodes, find_nodes_by_type, etc.) work now. "
+            "The inference encoder is busy with another encode and runs one at a time. "
+            f"Wait about {retry}s or longer, then call load_graph_energies(branch_id) "
+            "again — WITHOUT force_refresh, which would start another encode and can "
+            "be rejected — and the energies will be merged into this cache without "
+            "re-downloading the graph. Do not call energy endpoints in the meantime."
+        )
+    elif cache.encoding_in_progress:
         fields["encoding"] = progress or {"status": "encoding"}
         fields["next_step"] = (
             "Graph tools (read_node, grep_nodes, find_nodes_by_type, etc.) work now. "
@@ -3583,9 +3856,21 @@ async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> st
     This is the single entry point for all graph and energy analysis. It:
     1. Checks the local SQLite disk cache — returns immediately if fresh
     2. Triggers warm-up (encoding) on the inference server
-    3. Polls until encoding completes (2-5 min for large graphs)
+    3. Polls until encoding completes (2-5 min for large graphs). If the
+       encoder is busy with an encode that this call did not start (for
+       example a warm-up after a mapping run), it waits for that encode to
+       finish, then loads.
     4. Fetches the full graph and energy scores from the inference server
     5. Merges everything into a local SQLite cache
+
+    The server runs one encode at a time and rejects others. If the wait
+    budget (LATENT_DEFENSE_ENCODE_WAIT_SECS, default 900s) runs out, the
+    encoder is busy with a different graph, or the encode failed, the graph is
+    still loaded without energies. The result then has status
+    ``loaded_without_energies`` and an ``encoder`` object (``state`` is
+    ``busy``, ``encoding`` or ``failed``, with ``in_flight_branch``,
+    ``progress_pct``, ``retry_after_secs`` and ``error``); call again later
+    without force_refresh.
 
     All energy_*, grep_*, read_*, find_*, and get_graph_statistics tools
     require this to be called first.
@@ -3594,7 +3879,9 @@ async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> st
         branch_id: Branch to load.
         force_refresh: Delete the local cache and re-fetch from the server.
             Use after commit_graph() to get fresh JEPA energy scores for
-            newly added or modified nodes and edges. NOT needed when a
+            newly added or modified nodes and edges. This starts a new
+            encode, which the server rejects while another encode is
+            running. NOT needed when a
             previous load returned ``loaded_without_energies`` — a plain
             call completes the energy fetch in place.
     """
@@ -3645,11 +3932,8 @@ async def load_graph_energies(branch_id: str, force_refresh: bool = False) -> st
                     cached.energy_error = f"Energy fetch failed: {exc}"
                     log.warning("Energy refresh failed for branch %s: %s", branch_id, exc)
             else:
-                cached.encoding_in_progress = True
-                cached.energy_error = (
-                    f"Encoding still in progress after {_ENCODE_WAIT_SECS}s; "
-                    "energies not fetched to avoid a duplicate encode."
-                )
+                cached.encoding_in_progress = (progress or {}).get("status") != "failed"
+                cached.energy_error = _encode_wait_error(progress)
 
         if cached.has_energies and cached.repository_id:
             _start_jepa_keepalive(branch_id, cached.repository_id)

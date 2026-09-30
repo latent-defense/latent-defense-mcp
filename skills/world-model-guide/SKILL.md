@@ -22,7 +22,7 @@ The JEPA (Joint Embedding Predictive Architecture) model encodes your entire inf
 All tools prefixed with `mcp__latent-defense__`. Use ToolSearch to load schemas before calling.
 
 ### Graph loading (required before anything else)
-- `load_graph_energies(branch_id)` — load the full graph and energy scores into a local SQLite database. This is the single entry point — it handles JEPA warm-up, polling, and data fetch internally. The cache survives process restarts; subsequent loads are instant.
+- `load_graph_energies(branch_id)` — load the full graph and energy scores into a local SQLite database. This is the single entry point — it handles JEPA warm-up, polling, and data fetch internally. The server encodes one graph at a time: if the encoder is busy or the encode failed, you get `loaded_without_energies` with an `encoder` object; retry later without `force_refresh`. The cache survives process restarts; subsequent loads are instant.
 
 ### Graph structure (read the infrastructure)
 - `read_node(name)` — full node detail: type, description, properties, metadata
