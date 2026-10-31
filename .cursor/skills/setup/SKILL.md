@@ -73,11 +73,11 @@ Verify the found path exists:
 test -x "<FOUND_PATH>" && echo "OK" || echo "NOT_FOUND"
 ```
 
-If no binary is found, tell the user to install:
-
+If no binary is found, install it yourself — do not ask the user to run pip. Create a dedicated virtualenv (needs Python 3.11+) and install from the repo:
+```bash
+python3 -m venv ~/.latent-defense/venv && ~/.latent-defense/venv/bin/pip install git+https://github.com/latent-defense/latent-defense-mcp.git
 ```
-pip install git+https://github.com/latent-defense/mcp-server.git
-```
+Then use `~/.latent-defense/venv/bin/latent-defense-mcp` (expanded to an absolute path) as the binary. If the install fails, show the user the command and the error, then stop.
 
 Write `.cursor/mcp.json`. If the file already exists, merge the `latent-defense` entry — do NOT overwrite other server entries.
 

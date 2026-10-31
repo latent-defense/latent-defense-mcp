@@ -29,7 +29,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://latentdefense.ai"
 Documentation = "https://docs.latentdefense.ai"
-Repository = "https://github.com/latent-defense/mcp-server"
+Repository = "https://github.com/latent-defense/latent-defense-mcp"
 
 [project.scripts]
 latent-defense-mcp = "latent_defense_mcp.server:main"
