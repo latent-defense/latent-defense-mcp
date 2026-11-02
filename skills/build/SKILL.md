@@ -24,7 +24,7 @@ All tools prefixed with `mcp__latent-defense__`. Use ToolSearch to load schemas 
 
 **Detection ingestion**: `ingest_detection(source, severity, affected_resource_type, affected_resource_id, title, cve)`
 **Webhooks**: `register_webhook(url, events, template, secret, headers)`, `list_webhooks`, `delete_webhook`, `test_webhook`, `webhook_deliveries`, `validate_webhook_template`
-**Scheduling**: `list_scan_schedules`, `run_scan_schedule`, `create_inference_schedule(name, cron, branch_labels, all_branches)`, `list_inference_schedules`, `delete_inference_schedule`
+**Scheduling**: `list_scan_schedules`, `run_scan_schedule`, `create_inference_schedule(name, cron, branch_labels, all_branches, enabled, replace, repository_ids)`, `set_inference_schedule_enabled(schedule_id, enabled)`, `list_inference_schedules`, `delete_inference_schedule`
 **Scanning**: `create_mapping_run`
 **Connectors**: `list_connector_types`, `create_connector`, `list_connectors`, `test_connector`, `poll_connector`, `connector_health`
 **Health**: `trigger_stats`, `triage_stats`, `ingest_stats`
@@ -228,12 +228,12 @@ If no inference schedules exist, set one up:
 
 3. Create the schedule:
 
-   **All branches, daily at 3 AM:**
+   **Main branch, every 6 hours (recommended):**
    ```
    create_inference_schedule(
-     name="nightly-inference",
-     cron="0 3 * * *",
-     all_branches=true
+     name="main-survey",
+     cron="0 */6 * * *",
+     branch_labels='["main"]'
    )
    ```
 
@@ -246,9 +246,21 @@ If no inference schedules exist, set one up:
    )
    ```
 
-   Returns the created schedule with `schedule_id`.
+   **All branches, daily at 3 AM** (created paused unless `enabled=true` is passed, because it analyzes every repository):
+   ```
+   create_inference_schedule(
+     name="nightly-inference",
+     cron="0 3 * * *",
+     all_branches=true,
+     enabled=true
+   )
+   ```
 
-Note: When a mapping scan completes, inference automatically runs on the scanned branch (this is the `auto_run_on_map_complete` feature, enabled by default). The schedule is a safety net for branches that don't change often.
+   Returns the created schedule with `schedule_id`. A `branch_labels` schedule starts enabled and an `all_branches` one starts paused; pass `enabled` to override, and use `set_inference_schedule_enabled(schedule_id, enabled)` to switch it later. A schedule needs `branch_labels` or `all_branches=true`; prefer the main branch label over `all_branches`, which analyzes every repository's branches at once. `main` is the label of every repository's default branch, so pass `repository_ids='["<repository_id>"]'` to limit a schedule to some repositories. Schedules, on/off changes and deletes are saved and survive inference-trigger restarts.
+
+Note: When a mapping scan completes, inference automatically runs on the scanned branch (this is the `auto_run_on_map_complete` feature, enabled by default). The schedule is a safety net for branches that don't change often, and the way to analyze a graph that was mapped before inference was switched on. On deployments running the survey route, a tick skips any branch whose head was already analyzed, so a frequent schedule costs nothing until the graph changes; on older deployments every tick starts a new run per branch.
+
+Schedules created through the MCP are held in memory by inference-trigger and are lost when it restarts. For a schedule that must survive deploys, set it in the deployment's configuration (`inferenceTrigger.schedules`).
 
 ### Step 4 — Configure alert webhooks
 
@@ -532,7 +544,11 @@ def verify_signature(body: bytes, signature_header: str, secret: str) -> bool:
 | Error | Cause | Fix |
 |-------|-------|-----|
 | 401 Unauthorized | API key invalid | Regenerate in portal |
-| 422 on `create_inference_schedule` | Invalid cron expression or missing scope | Use standard 5-field cron (e.g. `0 3 * * *`) and set `all_branches=true` or `branch_labels` |
+| "five-field cron" from `create_inference_schedule` | Cron is not 5 fields, a value is out of range, or the weekday is a number | Use 5-field cron with weekday names (e.g. `0 3 * * *`, `0 2 * * mon-fri`); the scheduler counts numeric weekdays from Monday = 0 |
+| "Schedule scope is empty" from `create_inference_schedule` | Neither `branch_labels` nor `all_branches` given | Set `branch_labels='["main"]'` or `all_branches=true` |
+| Schedule listed but never runs | Created disabled (the default for `all_branches`) | `set_inference_schedule_enabled(schedule_id, true)` |
+| Schedule missing after a deploy | Schedules created through the MCP are not persisted by inference-trigger | Check `list_inference_schedules` first, then re-create it; put long-lived schedules in `inferenceTrigger.schedules` |
+| "already exists" from `create_inference_schedule` | A schedule with that name exists (possibly from the deployment's configuration) | Pick another name; pass `replace=true` only to overwrite it on purpose |
 | 422 on `register_webhook` | Invalid event type or malformed events JSON | Events must be a JSON array of strings from the supported set |
 | 422 on `validate_webhook_template` | Jinja2 syntax error in template | Fix the template syntax and re-validate |
 | Test webhook returns non-2xx | Target endpoint rejected the delivery | Check the URL, auth headers, and that the endpoint accepts POST |

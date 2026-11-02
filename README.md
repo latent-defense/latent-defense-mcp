@@ -5,53 +5,36 @@ MCP server that connects [Claude Code](https://docs.anthropic.com/en/docs/claude
 ## Quick start
 
 ```bash
-# 1. Install
-pip install git+https://github.com/latent-defense/mcp-server.git
+# 1. Clone the repo and open Claude Code in it
+git clone https://github.com/latent-defense/latent-defense-mcp.git
+cd latent-defense-mcp
+claude
 
-# 2. Scaffold config and skills into your project
-cd your-project
-python3 -m latent_defense_mcp.init
+# 2. In Claude Code, run /setup with your portal URL
+/setup https://portal.your-deployment.com
 
-# 3. Edit .mcp.json — set LATENT_DEFENSE_URL to your portal
-#    (looks like https://portal.your-deployment.com)
-
-# 4. Authenticate before restarting Claude Code
-latent-defense-mcp-login https://portal.your-deployment.com
-
-# 5. Restart Claude Code — tools are ready to use
+# 3. Approve the login code in your browser, then restart Claude Code when asked
 ```
 
-The login step stores your token in the OS keychain so the MCP server authenticates silently on startup. Type `/status` to verify the connection, or `/map` to start mapping infrastructure.
-
-> **Tip:** Use `/setup <url>` instead of steps 3-4 if you prefer a guided walkthrough that handles configuration and authentication for you.
-
-Run `latent-defense-mcp-login <url>` to authenticate before your first session — the token is stored in your OS keychain and refreshes automatically.
-
-> **Note:** Use `python3 -m latent_defense_mcp.init` instead of `latent-defense-mcp-init` if the entry point isn't on your PATH (common with virtualenv installs).
+`/setup` installs the server, configures `.mcp.json`, and runs the device-flow login for you — the token is stored in your OS keychain so the MCP server authenticates silently on startup. Type `/status` to verify the connection, or `/map` to start mapping infrastructure.
 
 ## Setup
 
 ### Option 1: Use the `/setup` skill (recommended)
 
-After installing and running `python3 -m latent_defense_mcp.init`, edit `.mcp.json` to set your portal URL, then run `latent-defense-mcp-login <url>` to authenticate. Restart Claude Code and your tools are ready.
-
-Alternatively, type `/setup <url>` for a guided walkthrough that handles configuration and authentication step by step.
-
-> **Important:** `/setup` won't be available until you run the init command and restart Claude Code. The init command copies the skill files into your project's `.claude/skills/` directory where Claude Code can find them.
+From a clone of this repo, type `/setup <url>`. It installs the server, configures `.mcp.json`, authenticates, and verifies the connection — choose automatic, or interactive to review each change before it's applied.
 
 ### Option 2: Manual setup
 
 #### 1. Install
 
-```bash
-pip install git+https://github.com/latent-defense/mcp-server.git
-```
+Run `/setup <url>` from a clone of this repo once — it installs the server into `~/.latent-defense/venv`. The commands below use that location.
 
 #### 2. Scaffold config and skills
 
 ```bash
 cd your-project
-python3 -m latent_defense_mcp.init
+~/.latent-defense/venv/bin/latent-defense-mcp-init .
 ```
 
 This creates:
@@ -75,18 +58,14 @@ Edit `.mcp.json` and replace the placeholder portal URL:
 }
 ```
 
-The `command` should be the full path to the binary (auto-detected by init). If you need to find it manually:
-
-```bash
-python3 -c "import shutil; print(shutil.which('latent-defense-mcp'))"
-```
+The `command` should be the full path to the binary (auto-detected by init) — e.g. the expanded path of `~/.latent-defense/venv/bin/latent-defense-mcp`.
 
 #### 4. Authenticate
 
 Before restarting Claude Code, authenticate with the login command:
 
 ```bash
-latent-defense-mcp-login https://portal.your-deployment.com
+~/.latent-defense/venv/bin/latent-defense-mcp-login https://portal.your-deployment.com
 ```
 
 This opens a device flow: you'll see a URL and code. Open the URL in your browser, sign in with your work account (SSO), and enter the code. The token is stored in your OS keychain and refreshes automatically.
@@ -294,7 +273,8 @@ Use difficulty as a ranking signal to prioritize paths relative to each other wi
 | `get_inference_run` | Get inference run status and results |
 | `ingest_detection` | Ingest a detection from an external tool to trigger targeted inference |
 | `list_inference_schedules` | List inference schedules |
-| `create_inference_schedule` | Create a recurring inference schedule |
+| `create_inference_schedule` | Create a recurring inference schedule, optionally limited to some repositories (starts enabled for branch labels, paused for all branches) |
+| `set_inference_schedule_enabled` | Switch an inference schedule on or off |
 | `delete_inference_schedule` | Delete an inference schedule |
 
 ### Triage

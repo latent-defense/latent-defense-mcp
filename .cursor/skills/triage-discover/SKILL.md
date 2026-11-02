@@ -30,9 +30,9 @@ If invoked independently (not by the `/triage` orchestrator), ask the user for f
 
 ## Phase 1: Load Findings into Store
 
-If `pipeline_status` shows findings already loaded (total > 0), **skip this step** unless the user explicitly asks to reload. Previous claims are preserved across reloads.
+If `pipeline_status` shows findings already loaded (total > 0), don't reload. Call `append_findings(project_id, path)` for each source file instead: it adds only findings that aren't already in the store (matched by finding ID), so new findings from an updated export get picked up and existing claims, groups and investigations are untouched.
 
-Otherwise, call `load_findings(project_id, path)` for each source file. This parses the JSON array into a queryable SQLite store with indexed columns for scanner, severity, repo, category.
+Otherwise, call `load_findings(project_id, paths=[...])` **once with every source file**. Calling it once per file keeps only the last file. This parses the JSON arrays into a queryable SQLite store with indexed columns for scanner, severity, repo, category.
 
 Call `findings_stats(project_id)` to see the distribution by severity, scanner, and category.
 

@@ -7,9 +7,11 @@ import json
 import os
 import logging
 import sys
+import re
 import time
 import uuid
 from typing import Any
+from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
 
@@ -799,7 +801,7 @@ async def create_mapping_run(
     cidrs: str = "[]",
     exclude_patterns: str = "[]",
     credentials_profile: str = "default",
-    model: str = "claude-sonnet-4-6",
+    model: str = "ld-default",
     dry_run: bool = False,
 ) -> str:
     """Create a mapping run with full control over scan scope and configuration.
@@ -816,7 +818,7 @@ async def create_mapping_run(
         cidrs: JSON array of CIDR strings to probe.
         exclude_patterns: JSON array of glob patterns to exclude.
         credentials_profile: Credential profile to use (default: "default").
-        model: LLM model for mapping agents (default: "claude-sonnet-4-6").
+        model: LLM model for mapping agents (default: "ld-default", resolved to the current Sonnet by api-proxy).
         dry_run: If true, validate the request without executing.
     """
     scope: dict[str, Any] = {}
@@ -994,27 +996,178 @@ async def list_inference_schedules() -> str:
     )
 
 
+# inference-trigger hands the five fields to APScheduler's CronTrigger, which stores
+# the schedule before parsing it: a cron it rejects leaves an enabled schedule with
+# no job. This accepts a subset of that grammar ("*", "*/n", "a", "a-b", "a/n",
+# "a-b/n", comma lists, month and weekday names). Weekdays must be names: CronTrigger
+# numbers them from Monday = 0, so the standard cron "1" would mean Tuesday.
+_CRON_NUMERIC = re.compile(r"(?:\*|(?P<first>\d+)(?:-(?P<last>\d+))?)(?:/(?P<step>\d+))?")
+_CRON_NAMES = re.compile(r"(?P<first>[a-z]{3})(?:-(?P<last>[a-z]{3}))?")
+_CRON_FIELDS = (("minute", 0, 59, ()), ("hour", 0, 23, ()), ("day", 1, 31, ()),
+                ("month", 1, 12, ("jan", "feb", "mar", "apr", "may", "jun",
+                                  "jul", "aug", "sep", "oct", "nov", "dec")),
+                ("weekday", None, None, ("mon", "tue", "wed", "thu", "fri", "sat", "sun")))
+
+
+def _cron_problem(cron: str) -> str | None:
+    """Why inference-trigger's scheduler would reject ``cron``, or None if it accepts it."""
+    fields = cron.split()
+    if len(fields) != 5:
+        return "it needs five fields (minute hour day month weekday)"
+    for (field, lo, hi, names), value in zip(_CRON_FIELDS, fields):
+        for item in value.lower().split(","):
+            m = _CRON_NAMES.fullmatch(item) if names else None
+            if m and m["first"] in names and (m["last"] or m["first"]) in names:
+                if names.index(m["first"]) > names.index(m["last"] or m["first"]):
+                    return f"the {field} range {item!r} runs backwards"
+                continue
+            if field == "weekday":
+                if item != "*":
+                    return f"use weekday names (mon-sun), not {item!r}"
+                continue
+            m = _CRON_NUMERIC.fullmatch(item)
+            if not m:
+                return f"{item!r} is not a valid {field} value"
+            first = lo if m["first"] is None else int(m["first"])
+            last = int(m["last"]) if m["last"] else (first if m["first"] and not m["step"] else hi)
+            step = int(m["step"]) if m["step"] else None
+            if not lo <= first <= last <= hi:
+                return f"{item!r} is outside the {field} range {lo}-{hi}"
+            if step is not None and not 1 <= step <= last - first:
+                return f"the step in {item!r} must be between 1 and the range it steps over"
+    return None
+
+
+def _schedule_path(schedule_id: str) -> str:
+    # Schedule IDs are sched_<name> and names are free text, so a "/" or "?" must
+    # not reach the URL path unescaped.
+    return f"/api/inference-schedules/{quote(schedule_id, safe='')}"
+
+
 @mcp.tool()
 async def create_inference_schedule(
     name: str,
     cron: str,
     branch_labels: str = "[]",
     all_branches: bool = False,
+    enabled: bool | None = None,
+    replace: bool = False,
+    repository_ids: str = "[]",
 ) -> str:
     """Create a recurring attack path analysis schedule.
 
+    Each tick analyzes the head of every branch in scope. On deployments that run
+    the survey route (the default since 2026-10), a branch whose head commit was
+    already analyzed is skipped at no cost, so a frequent schedule only does work
+    when the graph changes; on older deployments every tick starts a new LLM-backed
+    run per branch. Prefer branch_labels='["main"]' over all_branches:
+    all_branches analyzes every repository's branches at once. "main" is the label of
+    every repository's default branch, so pass repository_ids to limit a schedule to
+    some repositories.
+
+    Schedules are saved by inference-trigger and survive restarts and deploys, as do
+    on/off changes and deletes (LD-3714; older deployments lose them on restart).
+
     Args:
-        name: Schedule name.
-        cron: Cron expression (e.g. "0 2 * * *" for 2 AM daily).
+        name: Schedule name. Creating a schedule with the name of an existing one
+            replaces it, so this refuses unless replace is true.
+        cron: Five-field cron expression (e.g. "0 2 * * *" for 2 AM daily). Write
+            weekdays as names ("0 2 * * mon"): the scheduler counts numeric
+            weekdays from Monday = 0, so numbers are refused.
         branch_labels: JSON array of branch label strings to target. Ignored if all_branches is true.
         all_branches: Run on all branches if true.
+        enabled: Start the schedule immediately. Defaults to true for branch_labels
+            and to false for all_branches; use set_inference_schedule_enabled to switch it later.
+        replace: Overwrite an existing schedule with the same name.
+        repository_ids: JSON array of repository IDs (from list_repositories) the
+            schedule is limited to. Empty means every repository.
     """
-    body: dict[str, Any] = {"name": name, "cron": cron, "all_branches": all_branches}
-    if branch_labels != "[]":
-        body["branch_labels"] = _parse_json_param(branch_labels, "branch_labels")
+    name = name.strip()
+    if not name:
+        raise McpApiError("'name' must not be empty")
+    problem = _cron_problem(cron)
+    if problem:
+        raise McpApiError(
+            f"'cron' must be a five-field cron expression (minute hour day month weekday), "
+            f"e.g. \"0 3 * * *\" or \"0 2 * * mon-fri\"; got {cron!r}: {problem}"
+        )
+    fields = cron.split()
+    labels = _parse_json_param(branch_labels, "branch_labels")
+    if not isinstance(labels, list) or not all(isinstance(x, str) for x in labels):
+        raise McpApiError("'branch_labels' must be a JSON array of strings, e.g. '[\"main\"]'")
+    labels = [x.strip() for x in labels]
+    if any(not x for x in labels):
+        raise McpApiError("'branch_labels' must not contain blank labels")
+    if not all_branches and not labels:
+        raise McpApiError(
+            "Schedule scope is empty: set branch_labels (e.g. '[\"main\"]') or all_branches=true. "
+            "A schedule with an empty scope never analyzes anything."
+        )
+    repos = _parse_json_param(repository_ids, "repository_ids")
+    if not isinstance(repos, list) or not all(isinstance(x, str) and x.strip() for x in repos):
+        raise McpApiError("'repository_ids' must be a JSON array of repository IDs, e.g. '[\"repo_ld_1a2b\"]'")
+    repos = [x.strip() for x in repos]
+    previous: dict[str, Any] | None = None   # the schedule a replace would overwrite
+    if not replace or repos:
+        existing = await _get("/api/inference-schedules/", _tool="create_inference_schedule")
+        previous = next((
+            s for s in (existing if isinstance(existing, list) else [])
+            if isinstance(s, dict) and (s.get("name") == name or s.get("schedule_id") == f"sched_{name}")
+        ), None)
+        if previous is not None and not replace:
+            raise McpApiError(
+                f"A schedule named {name!r} already exists; creating it again would replace it. "
+                "Pick another name, or pass replace=true to overwrite it."
+            )
+    want_enabled = (not all_branches) if enabled is None else enabled
+    scope: dict[str, Any] = {"branch_labels": [] if all_branches else labels, "all_branches": all_branches}
+    if repos:
+        scope["repository_ids"] = repos
+    body: dict[str, Any] = {
+        "name": name,
+        "cron": " ".join(fields),
+        "scope": scope,
+        # A filtered schedule starts paused until the server is seen to keep the filter:
+        # an older inference-trigger drops unknown fields, which would widen it to every
+        # repository.
+        "enabled": want_enabled and not repos,
+    }
+    created = await _post("/api/inference-schedules/", body, _tool="create_inference_schedule")
+    if repos:
+        kept = ((created or {}).get("scope") or {}).get("repository_ids")
+        if kept != repos:
+            if previous is None:
+                await _delete(_schedule_path(f"sched_{name}"), _tool="create_inference_schedule")
+                outcome = "it was not created"
+            else:  # replace already overwrote it: put the original back rather than delete it
+                await _post("/api/inference-schedules/", {
+                    "name": name, "cron": previous.get("cron"), "scope": previous.get("scope"),
+                    "enabled": bool(previous.get("enabled")),
+                }, _tool="create_inference_schedule")
+                outcome = f"the existing schedule {name!r} was put back as it was"
+            raise McpApiError(
+                "This deployment's inference-trigger does not support repository_ids yet, so the "
+                f"schedule would have covered every repository; {outcome}."
+            )
+        if want_enabled:
+            created = await _patch(_schedule_path(f"sched_{name}"), {"enabled": True},
+                                   _tool="create_inference_schedule")
+    return json.dumps(created)
+
+
+@mcp.tool()
+async def set_inference_schedule_enabled(schedule_id: str, enabled: bool) -> str:
+    """Switch an attack path analysis schedule on or off.
+
+    Args:
+        schedule_id: Schedule ID from list_inference_schedules or create_inference_schedule.
+        enabled: true to start running on its cron, false to pause it.
+    """
     return json.dumps(
-        await _post(
-            "/api/inference-schedules/", body, _tool="create_inference_schedule"
+        await _patch(
+            _schedule_path(schedule_id),
+            {"enabled": enabled},
+            _tool="set_inference_schedule_enabled",
         )
     )
 
@@ -1024,7 +1177,7 @@ async def delete_inference_schedule(schedule_id: str) -> str:
     """Delete an attack path analysis schedule."""
     return json.dumps(
         await _delete(
-            f"/api/inference-schedules/{schedule_id}", _tool="delete_inference_schedule"
+            _schedule_path(schedule_id), _tool="delete_inference_schedule"
         )
     )
 
@@ -2734,7 +2887,9 @@ async def wait_for_load(timeout_secs: int = 600, poll_interval: int = 30) -> str
                 "error": progress.get("error"),
                 "message": "Encoding failed on the inference server.",
             }
-            # Pass busy details on so callers can wait instead of reporting a failure.
+            # When the server rejected this load because another encode is
+            # running it says so; pass the details on so callers can wait for
+            # that encode instead of reporting a generic failure.
             if progress.get("busy") or str(progress.get("error") or "").startswith("busy:"):
                 failed["busy"] = True
                 failed["message"] = (
@@ -3286,8 +3441,10 @@ You are processing scanner findings through the structural triage pipeline.
 
 ## Phase 1 — Load Findings
 
-Call `load_findings(project_id={json.dumps(project_id)}, path=<source_path>)` for each source file.
-This loads all findings into a queryable SQLite store.
+Call `load_findings(project_id={json.dumps(project_id)}, paths=[<every source path>])` once, with ALL source files.
+Calling it once per file keeps only the last file. This loads all findings into a queryable SQLite store.
+If the store already has findings from an earlier run, call `append_findings(project_id={json.dumps(project_id)}, path=<source_path>)`
+for each source instead — it adds only findings that aren't already in the store.
 Call `findings_stats(project_id={json.dumps(project_id)})` to see the distribution by severity, scanner, and category.
 
 ## Phase 2 — Create Groups
@@ -3574,10 +3731,17 @@ class RouteEncodeFailed(RuntimeError):
 async def wait_for_route_encode(
     branch_id: str, timeout: float, poll_interval: float = 15,
 ) -> dict[str, Any]:
-    """Poll ``/api/jepa/encoding-status`` until an encode this client did not start ends.
+    """Wait for an encode this MCP did not start, via ``GET /api/jepa/encoding-status``.
 
-    Returns a dict whose ``state`` is ``cached``, ``idle``, ``unsupported`` (older
-    server) or ``timeout``. Raises :class:`RouteEncodeFailed` if the encode failed.
+    Returns a dict whose ``state`` is one of:
+      * ``cached``      - the graph is encoded and cached on the server;
+      * ``idle``        - nothing is encoding for it (the encode already ended);
+      * ``unsupported`` - the server has no such endpoint (404, older server);
+      * ``timeout``     - still encoding when ``timeout`` ran out (the last
+        status body is merged in, so ``progress_pct`` etc. are available).
+    Raises :class:`RouteEncodeFailed` with the server's error on ``failed``.
+    Transient request errors are tolerated until the deadline. Never calls an
+    energy route, so it cannot start an encode.
     """
     deadline = time.time() + timeout
     last: dict[str, Any] = {}
@@ -3588,7 +3752,8 @@ async def wait_for_route_encode(
                 "/api/jepa/encoding-status", params={"branch_id": branch_id}, timeout=15,
             )
             if resp.status_code in (401, 403, 404, 405):
-                # Older server without the endpoint, or not permitted to poll.
+                # 404/405: older server without the endpoint. 401/403: polling
+                # would not succeed by waiting; do not burn the wait budget.
                 return {"state": "unsupported", "http_status": resp.status_code}
             if resp.status_code == 200:
                 body = resp.json()
@@ -3682,7 +3847,8 @@ async def _await_encoding(branch_id: str) -> tuple[bool | None, dict | None]:
                     busy["in_flight_branch"],
                 )
                 return False, busy
-            # Same branch: wait for the running encode, then load from the cache.
+            # Same branch: someone else is encoding this graph. Wait for that
+            # encode, then pick the result up from the server's cache.
             try:
                 route = await wait_for_route_encode(
                     branch_id, _ENCODE_WAIT_SECS, poll_interval=15,
@@ -3698,7 +3864,9 @@ async def _await_encoding(branch_id: str) -> tuple[bool | None, dict | None]:
                 retry = json.loads(await load_branch(branch_id))
                 if retry.get("status") == "loaded":
                     return True, None
-                # The other encode left no usable cache; a new one was started.
+                # The other encode ended without a usable cache, so this call's
+                # load_branch started a fresh encode. Not busy: report ordinary
+                # in-progress and let the caller retry once it finishes.
                 return False, {
                     "status": "encoding",
                     "restarted": True,

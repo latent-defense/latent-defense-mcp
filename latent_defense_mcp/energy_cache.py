@@ -83,9 +83,16 @@ class EncodingInProgress(RuntimeError):
 
 
 class EncodingBusy(EncodingInProgress):
-    """The inference server rejected the request because its encoder is busy (HTTP 503).
+    """The inference server rejected the request because its encoder is busy.
 
-    Not retried automatically; callers wait on the encoding-status endpoint.
+    The server runs one encode at a time and answers HTTP 503 with a JSON body
+    ``{"status": "busy", "same_branch": bool, "in_flight": {...}}`` (and a
+    ``Retry-After`` header) instead of starting a second one. Like its parent it
+    must NOT be retried automatically; callers wait on the server's
+    encoding-status endpoint and fetch once.
+
+    Attributes mirror the wire contract: ``in_flight_branch``, ``same_branch``,
+    ``progress_pct`` and ``retry_after`` (seconds, from the header or body).
     """
 
     def __init__(

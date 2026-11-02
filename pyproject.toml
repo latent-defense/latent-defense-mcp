@@ -50,6 +50,8 @@ packages = ["latent_defense_mcp"]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    # Contract test against the scheduler inference-trigger uses for schedules.
+    "apscheduler>=3.10,<4",
 ]
 
 [tool.pytest.ini_options]

@@ -1,7 +1,15 @@
 """Busy handling: the inference server runs one encode at a time.
 
-Energy routes answer HTTP 503 ``{"status": "busy", ...}`` while another encode
-runs, and ``GET /api/jepa/encoding-status`` reports the state of an encode.
+The wire contract (built server-side, mocked here):
+
+* energy routes answer HTTP 503 ``{"status": "busy", "same_branch": bool,
+  "in_flight": {...}}`` with ``Retry-After`` when another encode is running;
+* a session load rejected that way ends as encoding stage 9 with an error
+  starting ``busy:`` plus ``busy``/``same_branch``/``in_flight`` fields;
+* ``GET /api/jepa/encoding-status?branch_id=X`` returns HTTP 200 with a
+  ``state`` of ``encoding``, ``cached``, ``failed`` or ``idle`` (404 on older
+  servers).
+
 Energy endpoints are never retried automatically.
 """
 
@@ -55,6 +63,8 @@ class BusyOn(Recorder):
         return super().__call__(request)
 
 
+# 1. route-level mapping -----------------------------------------------------
+
 @pytest.mark.parametrize("route", [
     "/api/jepa/batch_entry_energies",
     "/api/jepa/graph_metadata",
@@ -107,6 +117,8 @@ async def test_refresh_records_busy_on_cache(tmp_path, monkeypatch):
     assert cache.encoding_in_progress and isinstance(cache.busy, EncodingBusy)
 
 
+# Fixtures for _await_encoding / wait_for_load ---------------------------------
+
 def _wire(monkeypatch, server, *, load_results, wait_results, route_handler=None):
     """Patch load_branch / wait_for_load / _http; return call log."""
     log = {"load": 0, "wait": 0, "energy": 0, "route": []}
@@ -152,6 +164,8 @@ BUSY_WAIT = {
 }
 
 
+# 2. same-branch busy: wait on the route encode, then load again -------------
+
 async def test_same_branch_busy_waits_for_route_encode_then_reloads(monkeypatch):
     from latent_defense_mcp import server
 
@@ -177,6 +191,8 @@ async def test_same_branch_busy_waits_for_route_encode_then_reloads(monkeypatch)
     assert log["energy"] == 0, "no energy routes may be called while waiting"
 
 
+# 3. different branch: immediate, no polling ------------------------------------
+
 async def test_busy_for_other_branch_returns_immediately(monkeypatch):
     from latent_defense_mcp import server
 
@@ -198,6 +214,8 @@ async def test_busy_for_other_branch_returns_immediately(monkeypatch):
     assert progress["in_flight_branch"] == "other"
     assert log["route"] == [] and log["energy"] == 0 and log["load"] == 1
 
+
+# 4. non-busy failure surfaces the error ---------------------------------------
 
 async def test_non_busy_failure_surfaces_error_not_timeout_text(tmp_path, monkeypatch):
     from latent_defense_mcp import server
@@ -241,6 +259,8 @@ async def _ret(v):
     return v
 
 
+# 5. old server (404) ------------------------------------------------------------
+
 async def test_route_status_404_falls_back_to_current_behavior(monkeypatch):
     from latent_defense_mcp import server
 
@@ -260,6 +280,8 @@ async def test_route_status_404_falls_back_to_current_behavior(monkeypatch):
     assert len(log["route"]) == 1, "no polling against a server without the endpoint"
     assert log["load"] == 1 and log["energy"] == 0
 
+
+# 6. route status failed ---------------------------------------------------------
 
 async def test_route_status_failed_surfaces_error(monkeypatch):
     from latent_defense_mcp import server
@@ -281,6 +303,8 @@ async def test_route_status_failed_surfaces_error(monkeypatch):
     assert progress["error"] == "graph fetch failed"
     assert log["load"] == 1 and log["energy"] == 0
 
+
+# 7. wait timeout while busy -> structured encoder object -------------------------
 
 async def test_wait_timeout_while_busy_gives_structured_encoder(tmp_path, monkeypatch):
     from latent_defense_mcp import server
@@ -317,6 +341,8 @@ async def test_wait_timeout_while_busy_gives_structured_encoder(tmp_path, monkey
     assert log["energy"] == 0
 
 
+# 8. warm-up unavailable -----------------------------------------------------------
+
 async def test_warmup_unavailable_falls_back_to_single_fetch(tmp_path, monkeypatch):
     from latent_defense_mcp import server
 
@@ -351,6 +377,8 @@ async def test_warmup_unavailable_falls_back_to_single_fetch(tmp_path, monkeypat
     assert len(rec.energy_bodies()) == 1, "exactly one fallback attempt"
 
 
+# 9. never retried --------------------------------------------------------------------
+
 async def test_busy_energy_call_is_never_retried_through_load(tmp_path, monkeypatch):
     from latent_defense_mcp import server
 
@@ -383,6 +411,8 @@ async def test_busy_energy_call_is_never_retried_through_load(tmp_path, monkeypa
     assert result["encoder"]["retry_after_secs"] == 30
     assert result["encoder"]["progress_pct"] == 42
 
+
+# 10. wait_for_load carries busy fields -------------------------------------------------
 
 async def test_wait_for_load_failed_result_includes_busy_fields(monkeypatch):
     from latent_defense_mcp import server

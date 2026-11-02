@@ -59,11 +59,14 @@ Find the binary:
 # 1. On PATH
 which latent-defense-mcp 2>/dev/null
 
-# 2. In a .venv in the project or parent directories
+# 2. The dedicated virtualenv /setup installs into (reuse it — don't reinstall)
+test -x ~/.latent-defense/venv/bin/latent-defense-mcp && echo ~/.latent-defense/venv/bin/latent-defense-mcp
+
+# 3. In a .venv in the project or parent directories
 find . -path './.venv/bin/latent-defense-mcp' -maxdepth 3 2>/dev/null
 find .. -path '*/.venv/bin/latent-defense-mcp' -maxdepth 4 2>/dev/null
 
-# 3. Via Python package
+# 4. Via Python package
 python3 -c "from pathlib import Path; import latent_defense_mcp; print(Path(latent_defense_mcp.__file__).resolve().parent.parent / '.venv' / 'bin' / 'latent-defense-mcp')" 2>/dev/null
 ```
 
@@ -73,11 +76,11 @@ Verify the found path exists:
 test -x "<FOUND_PATH>" && echo "OK" || echo "NOT_FOUND"
 ```
 
-If no binary is found, tell the user to install:
-
+If no binary is found, install it yourself — do not ask the user to run pip. Create a dedicated virtualenv (needs Python 3.11+) and install from the repo:
+```bash
+python3 -m venv ~/.latent-defense/venv && ~/.latent-defense/venv/bin/pip install git+https://github.com/latent-defense/latent-defense-mcp.git
 ```
-pip install git+https://github.com/latent-defense/mcp-server.git
-```
+Then use `~/.latent-defense/venv/bin/latent-defense-mcp` (expanded to an absolute path) as the binary. If the install fails, show the user the command and the error, then stop.
 
 Write `.cursor/mcp.json`. If the file already exists, merge the `latent-defense` entry — do NOT overwrite other server entries.
 
@@ -177,7 +180,8 @@ test -x "$LOGIN_CMD" && echo "OK" || echo "NOT_FOUND"
 If not found, fall back to:
 
 ```bash
-LOGIN_CMD="python3 -m latent_defense_mcp.login"
+PY="$(head -1 <FULL_PATH_TO_BINARY> | sed 's/^#!//')"   # the interpreter the binary was installed with
+LOGIN_CMD="$PY -m latent_defense_mcp.login"
 ```
 
 Run the login in the background and capture the device code:

@@ -10,11 +10,13 @@ The database file lives at ``~/.latent-defense/triage-state/findings-<project_id
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
+from collections import Counter, defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -93,7 +95,9 @@ class FindingsStore:
                 verdict         TEXT,
                 evidence        TEXT,
                 graph_corrections TEXT,
-                investigated_at TEXT
+                investigated_at TEXT,
+                covered_fingerprint TEXT,
+                covered_findings INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_findings_group ON findings(group_id);
             CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
@@ -101,6 +105,12 @@ class FindingsStore:
             CREATE INDEX IF NOT EXISTS idx_findings_repo ON findings(repo);
             CREATE INDEX IF NOT EXISTS idx_findings_category ON findings(category);
         """)
+        # Migrate stores created before verdicts recorded which findings they covered
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(investigations)").fetchall()}
+        for col, typ in (("covered_fingerprint", "TEXT"), ("covered_findings", "INTEGER")):
+            if col not in cols:
+                self._db.execute(f"ALTER TABLE investigations ADD COLUMN {col} {typ}")
+        self._db.commit()
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -124,6 +134,133 @@ def _get_store(project_id: str) -> FindingsStore:
 
 
 # ---------------------------------------------------------------------------
+# Parsing helpers shared by load_findings / append_findings
+# ---------------------------------------------------------------------------
+
+_INSERT_SQL = (
+    "INSERT OR REPLACE INTO findings "
+    "(idx, id, title, severity, category, scanner, source_file, repo, resource, data) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _read_findings_file(path: str) -> tuple[list[dict], str]:
+    """Read a JSON array of findings. Returns (findings, error)."""
+    p = Path(path).expanduser()
+    if not p.exists():
+        return [], f"File not found: {path}"
+    with open(p) as f:
+        findings = json.load(f)
+    if not isinstance(findings, list):
+        return [], f"Expected a JSON array of findings: {path}"
+    return [f for f in findings if isinstance(f, dict)], ""
+
+
+def _str(val: Any) -> str:
+    """Stringify a finding field; dicts collapse to their value/name/identifier."""
+    if val is None:
+        return ""
+    if isinstance(val, dict):
+        return val.get("value", val.get("name", val.get("identifier", json.dumps(val))))
+    if isinstance(val, list):
+        return json.dumps(val)
+    return str(val)
+
+
+def _finding_row(idx: int, finding: dict) -> tuple:
+    """Extract the indexed columns for one finding (order matches _INSERT_SQL)."""
+    return (
+        idx,
+        _str(finding.get("id", "")),
+        _str(finding.get("title", finding.get("name", ""))),
+        _str(finding.get("severity") or "").lower(),
+        _str(finding.get("category", finding.get("type", ""))),
+        _str(finding.get("scanner", finding.get("source", finding.get("_scanner", "")))),
+        _str(finding.get("_source_file", finding.get("source_file", ""))),
+        _str(finding.get("repo", finding.get("repository", finding.get("package", "")))),
+        _str(finding.get("resource", finding.get("affected_resource", finding.get("target", "")))),
+        json.dumps(finding),
+    )
+
+
+def _occurrence_key(fid: str, scanner: str, repo: str, resource: str, data: str) -> str:
+    """Identity of one finding occurrence across exports.
+
+    A finding ID alone isn't unique: the same CVE ID shows up once per
+    affected image or resource.  So the key is the ID plus where it was
+    found.  Findings without an ID are matched on their full content.
+    """
+    if fid:
+        return json.dumps(["id", fid, scanner, repo, resource])
+    return json.dumps(["data", data])
+
+
+def _row_key(row: tuple) -> str:
+    """Occurrence key for a row built by _finding_row."""
+    return _occurrence_key(row[1], row[5], row[7], row[8], row[9])
+
+
+_KEY_COLS = "id, scanner, repo, resource, data"
+
+
+def _canonical(data: str) -> str:
+    """Finding JSON with sorted keys, so field order doesn't change a fingerprint."""
+    try:
+        return json.dumps(json.loads(data), sort_keys=True)
+    except (TypeError, json.JSONDecodeError):
+        return data or ""
+
+
+def _group_fingerprint(db: sqlite3.Connection, group_id: str) -> tuple[str, int]:
+    """(fingerprint, count) of the findings currently claimed by a group.
+
+    Hashes each finding's full content, not just its identity, so a
+    re-exported finding with new severity or evidence changes the
+    fingerprint even though it keeps its claim.
+    """
+    keys = sorted(
+        _canonical(r[0])
+        for r in db.execute("SELECT data FROM findings WHERE group_id = ?", (group_id,))
+    )
+    return hashlib.sha256("\n".join(keys).encode()).hexdigest(), len(keys)
+
+
+def _stale_verdicts(db: sqlite3.Connection) -> dict[str, tuple[int, int]]:
+    """Groups whose findings changed since their verdict was saved.
+
+    Returns {group_id: (findings the verdict covered, findings now)}.
+    Verdicts saved before coverage was tracked are treated as current.
+    """
+    stale: dict[str, tuple[int, int]] = {}
+    for gid, fp, covered in db.execute(
+        "SELECT group_id, covered_fingerprint, covered_findings FROM investigations "
+        "WHERE verdict IS NOT NULL AND covered_fingerprint IS NOT NULL"
+    ).fetchall():
+        current_fp, current = _group_fingerprint(db, gid)
+        if current_fp != fp:
+            stale[gid] = (covered or 0, current)
+    return stale
+
+
+def _insert_rows(db: sqlite3.Connection, rows: list[tuple]) -> None:
+    for i in range(0, len(rows), 1000):
+        db.executemany(_INSERT_SQL, rows[i:i + 1000])
+
+
+def _summary(rows: list[tuple]) -> dict[str, Any]:
+    """Severity and top-10 scanner counts for a load/append result."""
+    sev: dict[str, int] = {}
+    scn: dict[str, int] = {}
+    for r in rows:
+        sev[r[3]] = sev.get(r[3], 0) + 1
+        scn[r[5]] = scn.get(r[5], 0) + 1
+    return {
+        "by_severity": dict(sorted(sev.items(), key=lambda x: -x[1])),
+        "by_scanner": dict(sorted(scn.items(), key=lambda x: -x[1])[:10]),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool registration
 # ---------------------------------------------------------------------------
 
@@ -135,132 +272,83 @@ def register(mcp: Any) -> None:
     # ------------------------------------------------------------------
 
     @mcp.tool()
-    async def load_findings(project_id: str, path: str) -> str:
-        """Load findings from a JSON array file into the queryable store.
+    async def load_findings(
+        project_id: str, path: str = "", paths: list[str] | None = None,
+    ) -> str:
+        """Load findings from one or more JSON array files into the queryable store.
 
         Parses each finding, extracts searchable fields into indexed columns,
-        and keeps the full JSON in the data column.  Replaces any previously
-        loaded findings for this project.
+        and keeps the full JSON in the data column.  Replaces every finding
+        previously loaded for this project, so pass ALL source files in one
+        call via ``paths`` — calling this once per file keeps only the last
+        file.  Groups and investigations are kept, and earlier claims are
+        restored by occurrence (finding ID plus scanner, repo and resource;
+        full content for findings without an ID).  Repeated occurrences get
+        their earlier claims back in order.
+        To add findings without replacing, use ``append_findings``.
 
         Args:
             project_id: Project identifier (matches triage project ID).
             path: Absolute path to a JSON file containing an array of findings.
+            paths: Several such files, loaded together in order. Use this
+                when the project has more than one source.
         """
-        p = Path(path).expanduser()
-        if not p.exists():
-            return json.dumps({"error": f"File not found: {path}"})
+        all_paths = list(paths or [])
+        if path:
+            all_paths.insert(0, path)
+        if not all_paths:
+            return json.dumps({"error": "Provide path or paths"})
+
+        parsed: list[dict] = []
+        for src in all_paths:
+            findings, err = _read_findings_file(src)
+            if err:
+                return json.dumps({"error": err})
+            parsed.extend(findings)
 
         store = _get_store(project_id)
         db = store.db
 
-        # Preserve existing claims before clearing — if findings are reloaded
-        # (e.g., after a rescan or MCP restart), we restore the group_id mappings
-        # so triage work isn't lost.
-        prior_claims: dict[int, tuple[str, str]] = {}
-        try:
-            for row in db.execute(
-                "SELECT idx, group_id, claimed_at FROM findings WHERE group_id IS NOT NULL"
-            ).fetchall():
-                prior_claims[row[0]] = (row[1], row[2])
-        except Exception:
-            pass  # table may not exist yet on first load
+        # Preserve existing claims before clearing, keyed by occurrence so a
+        # reordered or extended export maps claims back to the right finding.
+        # Unclaimed occurrences are kept too, so repeats line up in order.
+        prior: dict[str, deque] = defaultdict(deque)
+        for fid, scanner, repo, resource, data, group_id, claimed_at in db.execute(
+            f"SELECT {_KEY_COLS}, group_id, claimed_at FROM findings ORDER BY idx"
+        ).fetchall():
+            prior[_occurrence_key(fid, scanner, repo, resource, data)].append((group_id, claimed_at))
 
         # Clear existing findings only — groups and investigations are preserved
         db.execute("DELETE FROM findings")
-        db.commit()
-
-        with open(p) as f:
-            findings = json.load(f)
-
-        if not isinstance(findings, list):
-            return json.dumps({"error": "Expected a JSON array of findings"})
-
-        batch: list[tuple] = []
-        scanner_counts: dict[str, int] = {}
-        severity_counts: dict[str, int] = {}
-
-        for idx, finding in enumerate(findings):
-            if not isinstance(finding, dict):
-                continue
-
-            # Extract searchable fields — stringify any non-scalar values
-            def _str(val: Any) -> str:
-                if val is None:
-                    return ""
-                if isinstance(val, dict):
-                    return val.get("value", val.get("name", val.get("identifier", json.dumps(val))))
-                if isinstance(val, list):
-                    return json.dumps(val)
-                return str(val)
-
-            fid = _str(finding.get("id", ""))
-            title = _str(finding.get("title", finding.get("name", "")))
-            severity = _str(finding.get("severity") or "").lower()
-            category = _str(finding.get("category", finding.get("type", "")))
-            scanner = _str(finding.get("scanner", finding.get("source", finding.get("_scanner", ""))))
-            source_file = _str(finding.get("_source_file", finding.get("source_file", "")))
-            repo = _str(finding.get("repo", finding.get("repository", finding.get("package", ""))))
-            resource = _str(finding.get("resource", finding.get("affected_resource", finding.get("target", ""))))
-
-            batch.append((
-                idx, fid, title, severity, category, scanner,
-                source_file, repo, resource, json.dumps(finding),
-            ))
-
-            scanner_counts[scanner] = scanner_counts.get(scanner, 0) + 1
-            severity_counts[severity] = severity_counts.get(severity, 0) + 1
-
-            if len(batch) >= 1000:
-                db.executemany(
-                    "INSERT OR REPLACE INTO findings "
-                    "(idx, id, title, severity, category, scanner, source_file, repo, resource, data) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    batch,
-                )
-                batch.clear()
-
-        if batch:
-            db.executemany(
-                "INSERT OR REPLACE INTO findings "
-                "(idx, id, title, severity, category, scanner, source_file, repo, resource, data) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                batch,
-            )
+        rows = [_finding_row(idx, f) for idx, f in enumerate(parsed)]
+        _insert_rows(db, rows)
         db.commit()
 
         total = db.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
 
-        # Restore prior claims — findings at the same indices get their group_id back
+        # Restore prior claims whose group still exists
+        groups = {r[0] for r in db.execute("SELECT group_id FROM finding_groups").fetchall()}
         restored = 0
-        if prior_claims:
-            for idx, (group_id, claimed_at) in prior_claims.items():
-                # Only restore if the index still exists and the group still exists
-                exists = db.execute("SELECT 1 FROM findings WHERE idx = ?", (idx,)).fetchone()
-                group_exists = db.execute(
-                    "SELECT 1 FROM finding_groups WHERE group_id = ?", (group_id,)
-                ).fetchone()
-                if exists and group_exists:
-                    db.execute(
-                        "UPDATE findings SET group_id = ?, claimed_at = ? WHERE idx = ?",
-                        (group_id, claimed_at, idx),
-                    )
-                    restored += 1
-            db.commit()
+        for row in rows:
+            queue = prior.get(_row_key(row))
+            claim = queue.popleft() if queue else None
+            if claim and claim[0] in groups:
+                db.execute(
+                    "UPDATE findings SET group_id = ?, claimed_at = ? WHERE idx = ?",
+                    (claim[0], claim[1], row[0]),
+                )
+                restored += 1
+        db.commit()
 
         log.info("Loaded %d findings for project %s (restored %d prior claims)", total, project_id, restored)
 
-        # Top scanners and severities for the summary
-        top_scanners = sorted(scanner_counts.items(), key=lambda x: -x[1])[:10]
-        top_severities = sorted(severity_counts.items(), key=lambda x: -x[1])
-
         claimed_count = db.execute("SELECT COUNT(*) FROM findings WHERE group_id IS NOT NULL").fetchone()[0]
-
         result: dict[str, Any] = {
             "status": "loaded",
             "project_id": project_id,
+            "sources": len(all_paths),
             "total_findings": total,
-            "by_severity": dict(top_severities),
-            "by_scanner": dict(top_scanners),
+            **_summary(rows),
         }
         if restored > 0:
             result["restored_claims"] = restored
@@ -269,103 +357,70 @@ def register(mcp: Any) -> None:
         return json.dumps(result)
 
     @mcp.tool()
-    async def append_findings(project_id: str, path: str) -> str:
+    async def append_findings(project_id: str, path: str, skip_existing: bool = True) -> str:
         """Append new findings to an existing store without destroying claims or groups.
 
         New findings are assigned indices starting after the current max index.
         Existing findings, claims, groups, and investigations are untouched.
         Use this for iterative triage — add new scanner results or investigation
-        findings without resetting the pipeline.
+        findings without resetting the pipeline.  On an empty store it behaves
+        like a load.
+
+        By default, findings already in the store are skipped, so
+        re-appending a full export only adds what's new.  A finding matches
+        when its ID, scanner, repo and resource all match (full content for
+        findings without an ID), so the same CVE on a different image is
+        still added.  Matching is per occurrence: if the store holds one
+        copy and the file holds two, one is added.
 
         Args:
             project_id: Project identifier (matches triage project ID).
             path: Absolute path to a JSON file containing an array of findings.
+            skip_existing: Skip findings already in the store (default true).
         """
-        p = Path(path).expanduser()
-        if not p.exists():
-            return json.dumps({"error": f"File not found: {path}"})
+        findings, err = _read_findings_file(path)
+        if err:
+            return json.dumps({"error": err})
 
         store = _get_store(project_id)
         db = store.db
+
+        existing: Counter = Counter()
+        if skip_existing:
+            existing.update(
+                _occurrence_key(*r) for r in db.execute(f"SELECT {_KEY_COLS} FROM findings")
+            )
 
         # Start indices after current max
         row = db.execute("SELECT MAX(idx) FROM findings").fetchone()
         start_idx = (row[0] + 1) if row[0] is not None else 0
 
-        with open(p) as f:
-            findings = json.load(f)
-
-        if not isinstance(findings, list):
-            return json.dumps({"error": "Expected a JSON array of findings"})
-
-        batch: list[tuple] = []
-        scanner_counts: dict[str, int] = {}
-        severity_counts: dict[str, int] = {}
-
-        for i, finding in enumerate(findings):
-            if not isinstance(finding, dict):
+        rows: list[tuple] = []
+        skipped = 0
+        for finding in findings:
+            r = _finding_row(start_idx + len(rows), finding)
+            key = _row_key(r)
+            if existing[key] > 0:
+                existing[key] -= 1
+                skipped += 1
                 continue
-
-            idx = start_idx + i
-
-            def _str(val: Any) -> str:
-                if val is None:
-                    return ""
-                if isinstance(val, dict):
-                    return val.get("value", val.get("name", val.get("identifier", json.dumps(val))))
-                if isinstance(val, list):
-                    return json.dumps(val)
-                return str(val)
-
-            fid = _str(finding.get("id", ""))
-            title = _str(finding.get("title", finding.get("name", "")))
-            severity = _str(finding.get("severity") or "").lower()
-            category = _str(finding.get("category", finding.get("type", "")))
-            scanner = _str(finding.get("scanner", finding.get("source", finding.get("_scanner", ""))))
-            source_file = _str(finding.get("_source_file", finding.get("source_file", "")))
-            repo = _str(finding.get("repo", finding.get("repository", finding.get("package", ""))))
-            resource = _str(finding.get("resource", finding.get("affected_resource", finding.get("target", ""))))
-
-            batch.append((
-                idx, fid, title, severity, category, scanner,
-                source_file, repo, resource, json.dumps(finding),
-            ))
-
-            scanner_counts[scanner] = scanner_counts.get(scanner, 0) + 1
-            severity_counts[severity] = severity_counts.get(severity, 0) + 1
-
-            if len(batch) >= 1000:
-                db.executemany(
-                    "INSERT OR REPLACE INTO findings "
-                    "(idx, id, title, severity, category, scanner, source_file, repo, resource, data) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    batch,
-                )
-                batch.clear()
-
-        if batch:
-            db.executemany(
-                "INSERT OR REPLACE INTO findings "
-                "(idx, id, title, severity, category, scanner, source_file, repo, resource, data) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                batch,
-            )
+            rows.append(r)
+        _insert_rows(db, rows)
         db.commit()
 
-        appended = len(findings)
         total = db.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
         claimed = db.execute("SELECT COUNT(*) FROM findings WHERE group_id IS NOT NULL").fetchone()[0]
 
         return json.dumps({
             "status": "appended",
             "project_id": project_id,
-            "appended": appended,
+            "appended": len(rows),
+            "skipped_existing": skipped,
             "start_idx": start_idx,
             "total_findings": total,
             "claimed": claimed,
             "unclaimed": total - claimed,
-            "by_severity": dict(sorted(severity_counts.items(), key=lambda x: -x[1])),
-            "by_scanner": dict(sorted(scanner_counts.items(), key=lambda x: -x[1])[:10]),
+            **_summary(rows),
         })
 
     # ------------------------------------------------------------------
@@ -1050,8 +1105,14 @@ def register(mcp: Any) -> None:
                  graph_corrections or None, _dt_now()),
             )
 
-        # Also update group status if verdict is provided
+        # Record which findings the verdict covers, so a later change to the
+        # group's membership marks it stale. Also update group status.
         if verdict:
+            fp, count = _group_fingerprint(db, group_id)
+            db.execute(
+                "UPDATE investigations SET covered_fingerprint = ?, covered_findings = ? WHERE group_id = ?",
+                (fp, count, group_id),
+            )
             db.execute(
                 "UPDATE finding_groups SET status = 'investigated' WHERE group_id = ?",
                 (group_id,),
@@ -1068,6 +1129,11 @@ def register(mcp: Any) -> None:
     @mcp.tool()
     async def get_investigation(project_id: str, group_id: str) -> str:
         """Read investigation results for a group.
+
+        If the group's findings changed after its verdict was saved (added,
+        removed, or re-exported with different content), the result has
+        ``stale: true``: the verdict doesn't cover the current findings and
+        the group needs exploring and verifying again.
 
         Args:
             project_id: Project identifier.
@@ -1100,6 +1166,19 @@ def register(mcp: Any) -> None:
                 result["graph_corrections"] = json.loads(row[3])
             except json.JSONDecodeError:
                 result["graph_corrections"] = row[3]
+        if row[1]:
+            stale = _stale_verdicts(db).get(group_id)
+            if stale:
+                result["stale"] = True
+                changed = (
+                    f"The verdict covered {stale[0]} findings; the group now has {stale[1]}."
+                    if stale[0] != stale[1]
+                    else "Findings in the group changed (added, removed or re-exported "
+                    "with new content) since the verdict."
+                )
+                result["stale_reason"] = (
+                    f"{changed} Explore and verify the group again before relying on this verdict."
+                )
 
         return json.dumps(result)
 
@@ -1133,9 +1212,10 @@ def register(mcp: Any) -> None:
         ).fetchall():
             status_counts[r[0] or "open"] = r[1]
 
+        stale = _stale_verdicts(db)
         investigated = db.execute(
             "SELECT COUNT(*) FROM investigations WHERE verdict IS NOT NULL"
-        ).fetchone()[0]
+        ).fetchone()[0] - len(stale)
         explored_only = db.execute(
             "SELECT COUNT(*) FROM investigations "
             "WHERE explore_result IS NOT NULL AND verdict IS NULL"
@@ -1155,7 +1235,7 @@ def register(mcp: Any) -> None:
         )
         phases["investigate"] = (
             "complete" if investigated == groups_total and groups_total > 0
-            else "partial" if investigated > 0 or explored_only > 0
+            else "partial" if investigated > 0 or explored_only > 0 or stale
             else "pending"
         )
         routed_or_done = (
@@ -1194,6 +1274,7 @@ def register(mcp: Any) -> None:
             next_action = (
                 f"Investigate {pending_investigate} remaining groups "
                 f"({explored_only} have explore results awaiting verify, "
+                f"{len(stale)} have new findings since their verdict, "
                 f"{open_groups} not started)"
             )
         elif phases["route"] != "complete":
@@ -1212,6 +1293,7 @@ def register(mcp: Any) -> None:
             "investigated": investigated,
             "explored_only": explored_only,
             "pending_investigate": pending_investigate,
+            "stale_verdicts": sorted(stale),
             "group_status": status_counts,
             "phases": phases,
             "next_action": next_action,

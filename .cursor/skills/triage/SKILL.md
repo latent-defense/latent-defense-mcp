@@ -181,6 +181,7 @@ Before running the pipeline:
 
    Ask: **"These are the settings I'll run with. Anything to change?"** Wait for confirmation.
 5. Run using the pipeline — see Pipeline Orchestration above.
+6. When it completes, present the results and offer the follow-ups — see After the Pipeline Completes below.
 
 ### 2. Validate a structural lead
 
@@ -205,6 +206,22 @@ Free-form energy tool exploration. Use energy tools starting granular and wideni
 ### Reframing
 
 When the user reframes their understanding ("patch everything" → "what actually matters given our controls"), update `user_context`. The same graph supports different interpretations.
+
+## After the Pipeline Completes — Follow-up Options
+
+The follow-ups are separate skills, not part of this one, so the user can come back to any of them later in the session without running triage again. Remember they exist for the rest of the session.
+
+Once the pipeline finishes and you've shown the results, **offer these follow-ups and let the user choose. Don't run any of them automatically:**
+
+1. **Prioritized report** → `/prioritize-findings-report`: what to fix this week, what's safe to deprioritize, and what needs their input, with each group verified against the deployed environment and compared with their scanners' severity.
+2. **Deep dive on a group** → `/report-group-deep-dive`: one group's per-finding verdicts, its most critical path, the evidence, and the single fix that closes it.
+3. **Every path tried** → `/trace-blast-radius-all`: every path evaluated for a group or finding, dead ends included, with the control that stopped each one.
+
+Ask: **"Triage is done. Want the prioritized report, a deep dive on one group, or every path we tried for a group?"**
+
+**When the user asks about a specific finding, path or root cause** (at any point in the session, not only right after triage), suggest `/trace-blast-radius`: it traces how far that one weakness reaches and ranks the paths it opens. Then offer `/trace-blast-radius-all` for the dead ends.
+
+These skills read from the findings store (`list_groups`, `query_findings`, `get_investigation`), so their answers match what triage saved. None of them re-run the pipeline.
 
 ## Delivering to Audiences
 

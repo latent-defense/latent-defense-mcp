@@ -72,12 +72,24 @@ def _find_binary() -> str:
     if found:
         return str(Path(found).resolve())
 
-    # 2. In a .venv relative to this package
+    # 2. Next to the interpreter running init (e.g. ~/.latent-defense/venv).
+    # Don't resolve sys.executable: in a venv it symlinks to the base Python.
+    env_bin = Path(sys.executable).parent / "latent-defense-mcp"
+    if env_bin.exists():
+        return str(env_bin.resolve())
+
+    # 3. The dedicated virtualenv /setup installs into, for when init runs
+    # under a different interpreter (e.g. ``python3 -m`` from a clone)
+    home_venv = Path.home() / ".latent-defense" / "venv" / "bin" / "latent-defense-mcp"
+    if home_venv.exists():
+        return str(home_venv)
+
+    # 4. In a .venv relative to this package
     pkg_venv = PACKAGE_DIR.parent / ".venv" / "bin" / "latent-defense-mcp"
     if pkg_venv.exists():
         return str(pkg_venv.resolve())
 
-    # 3. Walk up from CWD looking for .venv
+    # 5. Walk up from CWD looking for .venv
     cwd = Path.cwd()
     for parent in [cwd, *cwd.parents]:
         candidate = parent / ".venv" / "bin" / "latent-defense-mcp"
@@ -86,7 +98,7 @@ def _find_binary() -> str:
         if parent == parent.parent:
             break
 
-    # 4. Bare command name as last resort
+    # 6. Bare command name as last resort
     return "latent-defense-mcp"
 
 

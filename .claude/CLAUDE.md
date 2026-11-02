@@ -149,6 +149,10 @@ Type `/latent-defense` for guided navigation, or invoke any skill directly:
 | `/explore` | Browse infrastructure graph — entry points, crown jewels, choke points, credentials. |
 | `/investigate` | Investigate a specific CVE, detection, alert, or finding against your graph. |
 | `/triage` | Scanner finding triage at scale. Orchestrates parallel sub-agents in both Claude Code and Cursor. |
+| `/prioritize-findings-report` | After triage: prioritized report — fix this week, safe to deprioritize, needs your input. |
+| `/report-group-deep-dive` | After triage: deep dive on one remediation group — verdicts, most critical path, the one fix. |
+| `/trace-blast-radius` | How far one finding, CVE or root cause reaches — ranked attack paths. |
+| `/trace-blast-radius-all` | Every path tried for a trace or group, dead ends and blocking controls included. |
 | `/research` | Proactive attack path discovery. |
 | `/review` | Walk the attack path triage queue. Review, validate, dismiss paths. |
 | `/diff` | Compare two graph snapshots. |

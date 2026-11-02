@@ -42,6 +42,7 @@ Otherwise, present these options using AskUserQuestion:
 
 5. **Triage scanner findings** — "I have scanner output and want structural triage at scale."
    → `/triage`
+   After triage, the follow-ups are `/prioritize-findings-report`, `/report-group-deep-dive` and `/trace-blast-radius-all`. If the user already ran triage and asks for one of these, route straight to it.
 
 6. **Find attack paths** — "Proactively discover attack paths I don't know about yet."
    → `/research`
@@ -57,6 +58,8 @@ Otherwise, present these options using AskUserQuestion:
 
 10. **Check deployment health** — "Quick health check of all services."
     → `/status`
+
+If the user asks how far one finding, CVE or root cause reaches (its blast radius), route directly to `/trace-blast-radius`.
 
 If the user is unsure, recommend `/tutorial` for new users or `/my-data` for returning users who want to see what they have.
 

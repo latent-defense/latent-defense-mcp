@@ -72,11 +72,14 @@ Find the binary by checking these locations in order — use the FIRST one that 
 # 1. On PATH
 which latent-defense-mcp 2>/dev/null
 
-# 2. In a .venv in the current directory or parent directories
+# 2. The dedicated virtualenv /setup installs into (reuse it — don't reinstall)
+test -x ~/.latent-defense/venv/bin/latent-defense-mcp && echo ~/.latent-defense/venv/bin/latent-defense-mcp
+
+# 3. In a .venv in the current directory or parent directories
 find . -path './.venv/bin/latent-defense-mcp' -maxdepth 3 2>/dev/null
 find .. -path '*/.venv/bin/latent-defense-mcp' -maxdepth 4 2>/dev/null
 
-# 3. In the latent_defense_mcp package location
+# 4. In the latent_defense_mcp package location
 python3 -c "from pathlib import Path; import latent_defense_mcp; print(Path(latent_defense_mcp.__file__).resolve().parent.parent / '.venv' / 'bin' / 'latent-defense-mcp')" 2>/dev/null
 ```
 
@@ -88,10 +91,11 @@ test -x "<FOUND_PATH>" && echo "OK" || echo "NOT_FOUND"
 
 Do NOT use `sysconfig.get_path('scripts')` — it returns the global scripts directory which may not contain the binary if the package was installed in a virtualenv.
 
-Show the user which path was found. If none found, tell them to install:
+Show the user which path was found. If no binary is found, install it yourself — do not ask the user to run pip. Create a dedicated virtualenv (needs Python 3.11+) and install from the repo:
+```bash
+python3 -m venv ~/.latent-defense/venv && ~/.latent-defense/venv/bin/pip install git+https://github.com/latent-defense/latent-defense-mcp.git
 ```
-pip install git+https://github.com/latent-defense/mcp-server.git
-```
+Then use `~/.latent-defense/venv/bin/latent-defense-mcp` (expanded to an absolute path) as the binary. If the install fails, show the user the command and the error, then stop.
 
 Ask: "Ready to continue?"
 
@@ -148,13 +152,14 @@ Ask: "Should I install these skills?" Wait for confirmation.
 If confirmed, run:
 
 ```bash
-latent-defense-mcp-init .
+"$(dirname <FULL_PATH_TO_BINARY>)/latent-defense-mcp-init" .
 ```
 
-If the command is not on PATH, fall back to:
+If that script doesn't exist, run init with the Python interpreter the binary was installed with (named on the binary's first line). System `python3` usually can't import the package when it lives in a virtualenv:
 
 ```bash
-python3 -m latent_defense_mcp.init .
+PY="$(head -1 <FULL_PATH_TO_BINARY> | sed 's/^#!//')"   # the interpreter the binary was installed with
+"$PY" -m latent_defense_mcp.init .
 ```
 
 Show the output — which skills were created, which were skipped (already exist).
@@ -177,7 +182,8 @@ test -x "$LOGIN_CMD" && echo "OK" || echo "NOT_FOUND"
 If not found, fall back to:
 
 ```bash
-LOGIN_CMD="python3 -m latent_defense_mcp.login"
+PY="$(head -1 <FULL_PATH_TO_BINARY> | sed 's/^#!//')"   # the interpreter the binary was installed with
+LOGIN_CMD="$PY -m latent_defense_mcp.login"
 ```
 
 **Run it in the background and read the output immediately.** The login command blocks until approval — if you run it synchronously, the conversation hangs and the user never sees the code.

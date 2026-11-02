@@ -73,20 +73,31 @@ log(`Audiences: ${audiences.map(a => a.name).join(', ')}`)
 // ═══════════════════════════════════════════════════════════════
 // Checkpoint: read pipeline status to determine what's already done
 // ═══════════════════════════════════════════════════════════════
+const sourcePaths = sources.map(s => s.path)
 const checkpoint = await agent(`
-ToolSearch query="select:mcp__latent-defense__pipeline_status" max_results=1
+ToolSearch query="select:mcp__latent-defense__pipeline_status,mcp__latent-defense__append_findings" max_results=2
 Call pipeline_status(project_id="${profileId}").
-Return the full result.
+
+If total_findings > 0 (an earlier run already loaded findings), pick up any new
+findings from the sources. Existing findings are skipped automatically:
+${sourcePaths.map(p => `  append_findings(project_id="${profileId}", path=${JSON.stringify(p)})`).join('\n')}
+Then call pipeline_status(project_id="${profileId}") again.
+
+If total_findings is 0, do NOT load anything — the Discover phase does that.
+
+Return the full result of the LAST pipeline_status call, plus new_findings: the
+sum of "appended" across the append_findings calls (0 if none were made).
 `, { label: 'checkpoint', phase: 'Load', model: 'haiku', schema: {
   type: 'object', properties: {
     total_findings: { type: 'integer' }, claimed: { type: 'integer' }, unclaimed: { type: 'integer' },
     groups: { type: 'integer' }, investigated: { type: 'integer' }, explored_only: { type: 'integer' },
-    pending_investigate: { type: 'integer' },
+    pending_investigate: { type: 'integer' }, new_findings: { type: 'integer' },
     phases: { type: 'object' }, next_action: { type: 'string' },
   },
 }})
 
 const cp = checkpoint || { phases: {} }
+if (cp.new_findings > 0) log(`Added ${cp.new_findings} new findings from sources — they will be claimed in Group/Sweep`)
 log(`Checkpoint: ${JSON.stringify(cp.phases || {})}`)
 log(`Next action: ${cp.next_action || 'start from beginning'}`)
 
@@ -295,7 +306,6 @@ if (cp.phases?.discover === 'complete') {
   totalFindings = cp.total_findings
 } else {
   log('Loading findings into store and discovering clusters...')
-  const allSourcePaths = sources.map(s => s.path)
   const discoverResult = await agent(`
 You are the discovery agent. Your job:
 
@@ -305,7 +315,9 @@ You are the discovery agent. Your job:
 ## Step 1: Load findings
 ${FINDINGS_TOOLS}
 
-${allSourcePaths.map(p => `Call load_findings(project_id="${profileId}", path="${p}")`).join('\n')}
+Load every source in ONE call — calling load_findings once per file keeps only the last file:
+ToolSearch query="select:mcp__latent-defense__load_findings" max_results=1
+Call load_findings(project_id="${profileId}", paths=${JSON.stringify(sourcePaths)})
 
 Then call findings_stats(project_id="${profileId}") to see the distribution.
 
@@ -519,7 +531,9 @@ mcp__latent-defense__get_investigation(project_id="${profileId}", group_id=<the 
 Step 4: Categorize each group:
 - If get_investigation returns "No investigation found" → needs both explore and verify → add to groups_needing_explore
 - If get_investigation returns explore_result but NO verdict → needs only verify → add to groups_needing_verify
-- If get_investigation returns a verdict → already done
+- If get_investigation returns a verdict with "stale": true → the group's findings changed after its
+  verdict, so the earlier exploration doesn't cover them → add to groups_needing_explore
+- If get_investigation returns a verdict and is not stale → already done
 
 Do NOT write Python scripts. Do NOT use Bash. Call MCP tools directly.
 `, { label: 'check-investigate', phase: 'Investigate', model: 'sonnet', schema: {
@@ -561,6 +575,9 @@ ${ENERGY_TOOLS}
 ${GRAPH_TOOLS}
 ${INVESTIGATE_TOOLS}
 
+0. Check for an earlier investigation: get_investigation(project_id="${profileId}", group_id="${group.group_id}").
+   If it exists (the group's findings changed since), read it as context only. Explore again from the
+   group's CURRENT findings, including any that joined since; your explore_result replaces the old one.
 1. Load the group's findings: query_findings(project_id="${profileId}", group_id="${group.group_id}")
 2. Find anchor nodes: grep_nodes for the affected services/resources
 3. Energy analysis: energy_node_scores, energy_lowest_hop, energy_trace_to_target
