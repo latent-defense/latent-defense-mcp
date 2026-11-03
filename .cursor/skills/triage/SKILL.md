@@ -137,7 +137,7 @@ Don't assume access methods. Don't assume local files are current. Don't assume 
 
 Then: **"Is this multi-tenant or single-tenant? Managed service or self-hosted?"** and **"What do you need out of this? What decisions are you trying to make?"**
 
-Save with `triage_save_project`: `branch_id`, `sources`, `verification_channels`, `deployment_model`, `audiences`, `user_context`.
+Save with `triage_save_project`: `branch_id`, `sources`, `verification_channels`, `deployment_model`, `audiences`, `user_context` (an object).
 
 Load the graph: `load_graph_energies(branch_id)`.
 

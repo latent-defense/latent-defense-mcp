@@ -29,7 +29,7 @@ Confirmed first. If there are more than 10, show all confirmed ones and
 the first few of each other verdict, and say how many more are in the JSON.
 - 🔴 <finding ID> · <source> · Confirmed: <why, in one line>
 - 🟢 <finding ID> · <source> · Refuted: <what blocks it>
-- 🟡 <finding ID> · <source> · Conditional: <what you couldn't check>
+- 🟡 <finding ID> · <source> · Conditional: <the one condition you couldn't see>
 - ⚪ <finding ID> · <source> · Inconclusive: <what data is missing>
 - 🔁 <finding ID> · <source> · Duplicate of <ID>
 

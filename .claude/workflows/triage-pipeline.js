@@ -30,6 +30,7 @@ ToolSearch query="select:mcp__latent-defense__triage_load_project,mcp__latent-de
 Call triage_load_project(project_id="${profileId}").
 Also call triage_load_user(name="default") or the first available user.
 Return all project fields: branch_id, sources, audiences, verification_channels, user_context, deployment_model, output_dir.
+Copy values exactly as the project has them. If a field is missing or empty in the project, leave it out — never fill it with placeholder text like "Not set".
 `, { label: 'load-project', phase: 'Load', model: 'haiku', schema: {
   type: 'object', properties: {
     branch_id: { type: 'string' }, sources: { type: 'array' }, audiences: { type: 'array' },

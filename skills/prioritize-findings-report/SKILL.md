@@ -28,8 +28,8 @@ Follow-ups in the same session: `/report-group-deep-dive` for any group in the r
 4. Give each path and each group one verdict:
    - **Confirmed:** every step holds in the deployed environment
    - **Refuted:** a step fails; name the control or config that blocks it. Only refute as "not deployed" if your check covered the account, project or cluster where it would run. A missing workflow or empty state elsewhere isn't proof: mark it Inconclusive and say which scope wasn't checked.
-   - **Conditional:** every step holds except one named condition you can't see
-   - **Inconclusive:** not enough data to decide; say what's missing
+   - **Conditional:** you verified every step except one named condition. If you couldn't see the deployed asset itself (the running image, the live cloud resource), it's Inconclusive.
+   - **Inconclusive:** you couldn't trace the path; say what's missing
 
    If the triage database returns "partial", split it into Conditional or Inconclusive. When you save the group's verdict, include each finding's own verdict in the evidence, so the per-finding counts come from what's stored. If a group from an earlier run has no per-finding verdicts stored, investigate that group to fill them in rather than inferring them.
 5. Connected doesn't mean affected. Only count a relationship as impact if there's a plausible attacker mechanism and enough permissions.
@@ -47,10 +47,13 @@ Use correct singular and plural throughout (1 group, 1 finding, 2 groups).
 Of <N> findings, sorted into remediation groups (findings that share one
 fix):
 - 🔴 Confirmed: <g> groups encompassing <n> findings need action
+- 🔵 Backlog: <g> groups encompassing <n> findings are confirmed but low
+  priority
 - 🟢 Refuted or informational: <g> groups encompassing <n> findings are
   safe to deprioritize
-- 🟡 Conditional or Inconclusive: <g> groups encompassing <n> findings need
-  your input
+- 🟡 Conditional: <g> groups encompassing <n> findings need your input
+- ⚪ Inconclusive: <n> findings and <g> newly discovered groups couldn't be
+  checked (see Why inconclusive)
 - 🔁 Duplicates: <n> findings duplicate another finding
 - 🆕 Newly discovered: <g> groups found outside your findings (included in
   the group counts above, not in <N>)
@@ -73,19 +76,21 @@ The rest are in the JSON.
 
 Title each group as one plain sentence that answers "What should I change, and why?": the change first, then what it stops. For example: "Require authentication on the internal metrics API, so workloads in the build namespace can no longer read deployment secrets through it." Don't use arrows or labels in the title.
 
-A group takes its strongest finding's verdict, in this order: Confirmed, Conditional, Inconclusive, Refuted.
+A group takes its strongest finding's verdict, in this order: Confirmed, Conditional, Refuted.
 
-Only list a group under Fix this week if it's verified: its verdict is Confirmed, with evidence for every step of at least one path, and its priority is Low or higher. Confirmed groups with Informational priority (real, but intentional or already compensated) go under Safe to deprioritize. Anything you couldn't verify goes under Needs your input, with what's missing. This applies to newly discovered groups too.
+Only list a group under Fix this week if it's verified: its verdict is Confirmed, with evidence for every step of at least one path, and its priority is Medium or higher. Confirmed groups with Low priority go under Backlog. Confirmed groups with Informational priority (real, but intentional or already compensated) go under Safe to deprioritize. Conditional findings go under Needs your input, with what's missing. This applies to newly discovered groups too.
+
+Leave inconclusive findings out of the groups and their counts. Count them only under Why inconclusive.
 
 ```
 ## 🔴 Fix this week
 Sort by priority, highest first, and start each line with the priority
-in capitals: [CRITICAL], [HIGH], [MEDIUM] or [LOW].
+in capitals: [CRITICAL], [HIGH] or [MEDIUM].
 
 1. [HIGH] <what to change>, so <what it stops or protects>
    Why: <why this priority, in one line>
    Findings in this group: <n> (<n> confirmed · <n> refuted ·
-   <n> conditional · <n> inconclusive)
+   <n> conditional)
    Recommendation: <what to do this week, in one line>
 2. [MEDIUM] ...
 
@@ -95,6 +100,10 @@ finding counts with how you found it and why no finding covers it:
    Why: <why this priority, in one line>
    Found outside your findings: <how you found it>
    Recommendation: <what to do this week, in one line>
+
+## 🔵 Backlog
+Confirmed, Low priority: fix in normal maintenance. Same group format as
+Fix this week, starting each line with [LOW].
 
 ## 🟢 Safe to deprioritize
 Refuted (not exploitable as deployed)
@@ -118,7 +127,7 @@ access.
 <#>. [HIGH] 🔑 <what to change>, so <what it stops or protects>
     Why: <why this priority if confirmed, in one line>
     Findings in this group: <n> (<n> confirmed · <n> refuted ·
-    <n> conditional · <n> inconclusive)
+    <n> conditional)
     Couldn't check: <what you couldn't verify, in one line>
     Grant us: <the smallest check that would settle it, e.g. "list active
     tokens with prefix ghp_ in the org", not org-admin access>, then rerun
@@ -126,9 +135,23 @@ access.
 <#>. [MEDIUM] ❓ <what to change>, so <what it stops or protects>
     Why: <why this priority if confirmed, in one line>
     Findings in this group: <n> (<n> confirmed · <n> refuted ·
-    <n> conditional · <n> inconclusive)
+    <n> conditional)
     Couldn't check: <what you couldn't verify, in one line>
     Answer: <one question we can reply to directly, yes/no where possible>
+
+## ⚪ Why inconclusive
+<n> findings couldn't be checked, so they're left out of the groups above.
+One line per cause, largest first, with the smallest check that would
+settle it:
+- <n> findings: <what you couldn't see, e.g. "no read access to the Azure
+  subscription">. Grant us: <smallest read-only check>, or Answer:
+  <one question>
+
+Then list each inconclusive newly discovered group, highest priority if
+confirmed first:
+- [HIGH] 🆕 <what to change>, so <what it stops or protects>. Couldn't
+  check: <what's missing>. Grant us: <smallest read-only check>, or
+  Answer: <one question>
 ```
 
 Keep all the evidence and every path you evaluated, so the user can ask about any group. Save the full results as JSON keyed by the original finding ID.

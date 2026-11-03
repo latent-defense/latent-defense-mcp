@@ -122,7 +122,8 @@ def register(mcp: Any) -> None:
         Args:
             project_id: Unique project identifier.
             project: JSON object with project fields (branch_id, sources, audiences,
-                     user_context, finding_groups, results, work_items, decisions, history).
+                     user_context (object), finding_groups, results, work_items, decisions,
+                     history).
         """
         data: dict = json.loads(project) if isinstance(project, str) else project
         state = _state_dir()
@@ -143,6 +144,7 @@ def register(mcp: Any) -> None:
             "deployment_model", "source_code_access", "cloud_access",
         }
 
+        skipped: list[str] = []
         for key, val in data.items():
             # Config fields are locked once they have a meaningful value.
             # Empty string, None, and empty list [] are NOT meaningful — allow overwrite.
@@ -156,7 +158,9 @@ def register(mcp: Any) -> None:
                     and existing_val != {}
                 )
                 if has_value:
-                    # Protected field already set with real value — skip silently
+                    # Protected field already set with real value — skip, and report it
+                    if val != existing_val:
+                        skipped.append(key)
                     continue
             if isinstance(val, dict) and isinstance(existing.get(key), dict):
                 existing[key].update(val)
@@ -180,6 +184,7 @@ def register(mcp: Any) -> None:
             "work_items": len(existing.get("work_items", [])),
             "decisions": len(existing.get("decisions", [])),
             "updated_at": existing["_updated_at"],
+            "skipped_locked_fields": skipped,
         })
 
     @mcp.tool()

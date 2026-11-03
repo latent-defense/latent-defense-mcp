@@ -23,7 +23,7 @@ Check authentication first with `connection_status()`. If it has expired, tell t
 1. Find where it lives in the graph: search nodes and edges for the affected code, routes and services (`grep_nodes`, `grep_edges`). If you can't map it, say what mapping is missing.
 2. Run `/investigate` with this as the question. Follow it from each entry point (`energy_node_neighborhood`, `energy_lowest_paths`, `energy_trace_to_target`, `energy_momentum_path`) and evaluate every candidate path. Use `energy_defenses` to find the controls that block movement. Save every path you evaluated, refuted ones included, with `save_investigation` under a group named for this input.
 3. If the user attached findings, or a triage project exists, check which findings sit on each path.
-4. Give each path one verdict: Confirmed (every step holds), Refuted (a step fails; name what blocks it), Conditional (one named condition you can't see), or Inconclusive (not enough data; say what's missing).
+4. Give each path one verdict: Confirmed (every step holds), Refuted (a step fails; name what blocks it), Conditional (you verified every step except one named condition; if you couldn't see the deployed asset itself, such as the running image or the live cloud resource, it's Inconclusive), or Inconclusive (you couldn't trace the path; say what's missing).
 5. Connected doesn't mean affected: only count a relationship as impact if there's a plausible attacker mechanism and enough permissions. Cite evidence for every step.
 
 Only use evidence from the investigation. If something wasn't checked, say so instead of filling it in. Keep all the evidence and every path you evaluated, so the user can ask about any of them.

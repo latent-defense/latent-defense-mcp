@@ -423,6 +423,29 @@ class TestTriageStateTools:
             assert not any(g["field"] == "deployment_model" for g in result["gaps"])
             assert not any(g["field"] == "verification_channels" for g in result["gaps"])
 
+    async def test_save_project_reports_skipped_protected_fields(self):
+        save_fn = self.mcp._tool_manager._tools["triage_save_project"].fn
+        load_fn = self.mcp._tool_manager._tools["triage_load_project"].fn
+
+        await save_fn(project_id="p1", project=json.dumps({
+            "branch_id": "branch_a", "audiences": [{"name": "Eng"}],
+        }))
+        result = json.loads(await save_fn(project_id="p1", project=json.dumps({
+            "branch_id": "branch_a",  # unchanged: not reported
+            "audiences": [{"name": "Eng", "report_outline": "short"}],
+            "user_context": {"desired_outcomes": "fix list"},
+        })))
+
+        assert result["skipped_locked_fields"] == ["audiences"]
+        loaded = json.loads(await load_fn(project_id="p1"))
+        assert loaded["audiences"] == [{"name": "Eng"}]
+        assert loaded["user_context"] == {"desired_outcomes": "fix list"}
+
+    async def test_save_project_no_skips_reported(self):
+        save_fn = self.mcp._tool_manager._tools["triage_save_project"].fn
+        result = json.loads(await save_fn(project_id="p1", project=json.dumps({"branch_id": "b"})))
+        assert result["skipped_locked_fields"] == []
+
     async def test_get_workflow_args_missing_branch(self):
         save_fn = self.mcp._tool_manager._tools["triage_save_project"].fn
         args_fn = self.mcp._tool_manager._tools["triage_get_workflow_args"].fn
