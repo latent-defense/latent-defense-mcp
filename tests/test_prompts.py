@@ -73,7 +73,7 @@ async def test_triage_queue_review_renders_well_formed():
     # the agent to acknowledge a `new` path first and use a structured reason —
     # otherwise it 422s on most of the queue.
     assert "acknowledged" in text
-    assert "compensating_control" in text
+    assert "not_applicable" in text and "compensating_control" not in text
     # Big queues shouldn't be silently truncated at 20.
     assert "has_more" in text
 

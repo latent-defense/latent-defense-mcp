@@ -93,12 +93,12 @@ After presenting each path, ask the user what to do:
 
 ### Dismiss reasons
 
-When dismissing, use structured reasons:
-- `compensating_control` — a control not in the graph mitigates this path
-- `network_segmentation` — network controls prevent this path in practice
-- `service_decommissioned` — the affected service is being retired
+When dismissing, use structured reasons. The first three file the path under Remediated, the rest under Closed:
+- `fixed` — the cause was fixed
+- `mitigated` — a control was added to block this path
 - `risk_accepted` — risk acknowledged and accepted by the organization
-- `not_applicable` — path does not apply to this deployment model
+- `false_positive` — the path is not real
+- `not_applicable` — the path does not apply, including when a control or network segmentation was already in place
 - `other` — free-form with required note
 
 ### Validation monitoring
@@ -197,7 +197,7 @@ Save review decisions to the project with `triage_add_decision` for risk accepta
 - `get_validation_status(run_id)` — check sandbox validation progress
 - `dismiss_path(path_id, reason, note, expires_at)` — dismiss with structured reason
 - `undismiss_path(path_id, reason, note)` — restore a dismissed path
-- `bulk_update_paths(action, status_filter, repository_id, reason, note, limit)` — batch operations
+- `bulk_update_paths(action, status_filter, repository_id, reason, note, limit, path_ids)` — act on more than one path in one call; pass `path_ids` for a specific list (any size). Dismiss acknowledges `new` paths first, so any of the listed paths can be dismissed. For a single path, or a dismissal with `expires_at`, use `dismiss_path` (if the path is still `new`, acknowledge it first with `update_path_status`).
 - `override_risk_score(path_id, risk_score, reason)` — set user risk score (0-100); model score preserved
 - `clear_risk_override(path_id)` — remove user score override
 - `add_path_comment(path_id, text, author)` — attach investigation notes

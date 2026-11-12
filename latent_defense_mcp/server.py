@@ -10,6 +10,7 @@ import sys
 import re
 import time
 import uuid
+from collections import Counter
 from typing import Any
 from urllib.parse import quote
 
@@ -1529,8 +1530,10 @@ async def dismiss_path(
 
     Args:
         path_id: Attack path ID. Must be in 'validated' or 'acknowledged' state.
-        reason: Dismiss reason — one of: compensating_control, network_segmentation,
-                service_decommissioned, risk_accepted, not_applicable, other.
+        reason: Dismiss reason — one of: fixed, mitigated (a control was added to block the path),
+                risk_accepted, false_positive, not_applicable (including a control or network
+                segmentation that was already in place), other. fixed, mitigated and risk_accepted
+                file the path under Remediated; the rest under Closed.
         note: Optional free-text explanation.
         expires_at: Optional ISO-8601 datetime after which the dismissal expires and the
                     path reopens automatically (e.g. "2027-01-01T00:00:00Z").
@@ -1579,6 +1582,10 @@ async def undismiss_path(path_id: str, reason: str, note: str = "") -> str:
     )
 
 
+_BULK_PATHS_CHUNK = 500  # triage BULK_PATHS_MAX
+_BULK_IDS_SHOWN = 100  # path IDs listed per failure group (and for not-sent IDs); counts are always complete
+
+
 @mcp.tool()
 async def bulk_update_paths(
     action: str,
@@ -1588,8 +1595,19 @@ async def bulk_update_paths(
     reason: str = "",
     note: str = "",
     limit: int = 50,
+    path_ids: list[str] | None = None,
 ) -> str:
-    """Apply a triage action to multiple paths that match a filter in a single call.
+    """Apply a triage action to many paths in one call: an explicit list of path IDs, or the paths
+    that match a filter. Triage applies it server-side (POST /api/triage/paths/bulk). Returns the
+    counts, the new status of the paths that succeeded, and the failed path IDs grouped by reason.
+
+    A dismissed path always has status `false_positive`, whatever its dismiss reason; the reason
+    (e.g. risk_accepted) is stored separately as `dismiss_reason`. A `conflict` when dismissing a path
+    already in `false_positive` means it is already dismissed and its reason was left as it was; to
+    change the reason, reopen it with undismiss_path first.
+
+    Dismiss acknowledges paths still in `new` first (triage only dismisses acknowledged or validated
+    paths), so a list of path_ids can be dismissed whatever their status.
 
     Args:
         action: Action to apply — acknowledge, dismiss, or close.
@@ -1598,10 +1616,16 @@ async def bulk_update_paths(
                        close→new,acknowledged,validating,validated,ticketed,failed.
         min_risk_score: Only act on paths with risk_score >= this value.
         repository_id: Only act on paths from this repository.
-        reason: Required for action=dismiss. Dismiss reason — one of: compensating_control,
-                network_segmentation, service_decommissioned, risk_accepted, not_applicable, other.
+        reason: Required for action=dismiss. Dismiss reason — one of: fixed, mitigated,
+                risk_accepted, false_positive, not_applicable, other (see dismiss_path).
         note: Optional note applied to every path.
         limit: Maximum paths to update (1–200, default 50).
+        path_ids: Explicit path IDs to act on, any number (sent in chunks of 500). Use instead of
+                  status_filter/min_risk_score/repository_id/limit, not with them.
+
+    If a request fails, the tool stops and returns the error with what earlier chunks did, plus
+    `not_confirmed`: the path IDs of the failed request and of the chunks after it. Re-sending the
+    same path_ids finishes the job.
     """
     if not action:
         return json.dumps({"error": "action is required"})
@@ -1617,6 +1641,15 @@ async def bulk_update_paths(
         "close": {"new", "acknowledged", "validating", "validated", "ticketed", "failed", "false_positive"},
         "dismiss": {"acknowledged", "validated"},
     }
+    ids: list[str] | None = None
+    if path_ids is not None:
+        if status_filter or min_risk_score > 0 or repository_id:
+            return json.dumps({"error": "path_ids cannot be combined with status_filter, min_risk_score or repository_id"})
+        # An empty list must not fall back to filter mode: "act on nothing" would become "act on
+        # every path matching the default filter".
+        ids = list(dict.fromkeys(s for p in path_ids if (s := str(p).strip())))
+        if not ids:
+            return json.dumps({"error": "path_ids is empty; pass at least one path ID, or omit path_ids to select by filter"})
     if status_filter and action in _VALID_SOURCES and status_filter not in _VALID_SOURCES[action]:
         valid = sorted(_VALID_SOURCES[action])
         return json.dumps({
@@ -1638,55 +1671,88 @@ async def bulk_update_paths(
     }
     effective_status = status_filter or _DEFAULT_STATUS.get(action, "")
 
-    list_params: dict[str, Any] = {"limit": limit, "offset": 0}
-    if effective_status:
-        list_params["status"] = effective_status
-    if min_risk_score > 0:
-        list_params["min_risk_score"] = min_risk_score
-    if repository_id:
-        list_params["repository_id"] = repository_id
+    base: dict[str, Any] = {"action": action}
+    if reason:
+        base["reason"] = reason
+    if note:
+        base["note"] = note
+    if action == "dismiss":
+        base["acknowledge_first"] = True  # triage acknowledges `new` paths, then dismisses them
+    if ids is not None:
+        bodies = [{**base, "path_ids": ids[i:i + _BULK_PATHS_CHUNK]} for i in range(0, len(ids), _BULK_PATHS_CHUNK)]
+    else:
+        path_filter: dict[str, Any] = {"status": [st for st in effective_status.split(",") if st]}
+        if min_risk_score > 0:
+            path_filter["min_risk_score"] = min_risk_score
+        if repository_id:
+            path_filter["repository_id"] = repository_id
+        bodies = [{**base, "filter": path_filter, "limit": limit}]
 
-    list_result = await _get("/api/triage/paths", _tool="bulk_update_paths", **list_params)
-    if not isinstance(list_result, dict):
-        return json.dumps({"error": "Failed to fetch paths", "detail": list_result})
-
-    items = list_result.get("items", [])
-    results = []
-    for p in items:
-        if not isinstance(p, dict):
-            continue
-        path_id = p.get("path_id")
-        if not path_id:
-            continue
+    results: list[dict[str, Any]] = []
+    for i, body in enumerate(bodies):
+        # Stop at the first request that doesn't come back with per-path results and report the error
+        # once, with what the earlier chunks did, rather than marking every path failed.
         try:
-            if action == "acknowledge":
-                body: dict[str, Any] = {"status": "acknowledged"}
-                if note:
-                    body["note"] = note
-                res = await _patch(f"/api/triage/paths/{path_id}/status", body, _tool="bulk_update_paths")
-            elif action == "dismiss":
-                body = {"reason": reason}
-                if note:
-                    body["note"] = note
-                res = await _post(f"/api/triage/paths/{path_id}/dismiss", body, _tool="bulk_update_paths")
-            else:  # close
-                body = {"status": "closed"}
-                if note:
-                    body["note"] = note
-                res = await _patch(f"/api/triage/paths/{path_id}/status", body, _tool="bulk_update_paths")
-            results.append({"path_id": path_id, "success": True})
+            res = await _post("/api/triage/paths/bulk", body, _tool="bulk_update_paths")
         except Exception as exc:
-            results.append({"path_id": path_id, "success": False, "error": str(exc)})
+            return json.dumps(_bulk_stopped(action, results, bodies[i:], "Bulk update failed",
+                                            str(exc) or type(exc).__name__))
+        if not isinstance(res, dict) or not isinstance(res.get("results"), list):
+            return json.dumps(_bulk_stopped(action, results, bodies[i:], "Bulk update did not complete", res))
+        results.extend(r for r in res["results"] if isinstance(r, dict))
 
-    succeeded = sum(1 for r in results if r["success"])
-    return json.dumps({
+    return json.dumps(_summarize_bulk(action, results))
+
+
+def _bulk_stopped(action: str, results: list[dict[str, Any]], remaining: list[dict[str, Any]],
+                  error: str, detail: Any) -> dict[str, Any]:
+    """bulk_update_paths result when a request failed. `remaining` is the failed request and the
+    chunks after it; their paths may or may not have been updated, so they are `not_confirmed`."""
+    out: dict[str, Any] = {"error": error, "detail": detail}
+    if results:
+        out.update(_summarize_bulk(action, results))
+    ids = [pid for b in remaining for pid in b.get("path_ids", [])]
+    if ids:
+        out["not_confirmed"] = len(ids)
+        out["not_confirmed_path_ids"] = ids[:_BULK_IDS_SHOWN]
+        out["note"] = ("Re-send the same path_ids to finish: paths already updated come back as "
+                       "conflict and are not changed.")
+    return out
+
+
+def _summarize_bulk(action: str, results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compact bulk_update_paths result: counts, the new status of the paths that succeeded, and the
+    failed path IDs grouped by (status, error). Per-path entries for thousands of paths are far over
+    the size an MCP client accepts for one tool result, so successes are counted, not listed, and each
+    failure group lists at most _BULK_IDS_SHOWN IDs (with `showing` when it is cut)."""
+    ok = [r for r in results if r.get("status") == "ok"]
+    groups: dict[tuple[str, str], list[str]] = {}
+    for r in results:
+        if r.get("status") == "ok":
+            continue
+        pid = str(r.get("path_id") or "")
+        # Errors that name the path ("Path p1 not found") would otherwise make one group per path.
+        error = str(r.get("error") or "").replace(pid, "<path_id>") if pid else str(r.get("error") or "")
+        groups.setdefault((str(r.get("status") or "error"), error), []).append(pid)
+    failures = []
+    for (status, error), ids in sorted(groups.items(), key=lambda g: -len(g[1])):
+        group: dict[str, Any] = {"status": status, "error": error, "count": len(ids),
+                                 "path_ids": ids[:_BULK_IDS_SHOWN]}
+        if len(ids) > _BULK_IDS_SHOWN:
+            group["showing"] = _BULK_IDS_SHOWN
+        failures.append(group)
+    out: dict[str, Any] = {
         "action": action,
-        "total_matched": list_result.get("total", len(items)),
         "applied_to": len(results),
-        "succeeded": succeeded,
-        "failed": len(results) - succeeded,
-        "results": results,
-    })
+        "succeeded": len(ok),
+        "failed": len(results) - len(ok),
+        "succeeded_by_status": dict(Counter(str(r.get("path_status")) for r in ok)),
+        "failures": failures,
+    }
+    if any("showing" in g for g in failures):
+        out["note"] = (f"Each failure group lists its first {_BULK_IDS_SHOWN} path IDs; `count` is the full "
+                       "number. All paths in a group failed for the same reason.")
+    return out
 
 
 @mcp.tool()
@@ -3075,8 +3141,9 @@ interactive triage session.
                       `validated`, so if it is still `new` call
                       update_path_status(path_id, "acknowledged") first, then
                       dismiss_path(path_id, reason=...). `reason` must be one of:
-                      compensating_control, network_segmentation,
-                      service_decommissioned, risk_accepted, not_applicable, other.
+                      fixed, mitigated (a control was added), risk_accepted,
+                      false_positive, not_applicable (including a control
+                      already in place), other.
 
 Start now with step 1, then summarise the queue before we walk the individual paths.
 """
