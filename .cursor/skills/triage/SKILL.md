@@ -1,6 +1,6 @@
 ---
 name: triage
-description: "Structural security triage. Process scanner findings, group by remediation action, investigate against the infrastructure graph using JEPA energy signals, and produce audience-specific reports. Orchestrates parallel sub-agents for each pipeline phase."
+description: "Structural security triage. Prioritizes scanner findings when you provide them, or the attack-path queue as root causes when you don't. Groups by remediation action, investigate against the infrastructure graph using JEPA energy signals, and produce audience-specific reports. Orchestrates parallel sub-agents for each pipeline phase."
 user-invocable: true
 disable-model-invocation: false
 ---
@@ -36,7 +36,7 @@ A global tracker prevents double-claims across parallel agents. The recursion te
 
 **Investigate** — Two-stage pipeline per group:
 - Stage 1 (Explore): Energy-only. Maps structural position using `energy_node_scores`, `energy_lowest_hop`, `energy_trace_to_target`. Produces: where does this sit, what controls exist, what's reachable, what files should the verifier check?
-- Stage 2 (Verify): Code/config verification. Gets the structural map, reads actual source code or configuration via the configured verification channels. Produces a verdict (confirmed / refuted / partial) with evidence cited from code, not from the graph.
+- Stage 2 (Verify): Code/config verification. Gets the structural map, reads actual source code or configuration via the configured verification channels. Produces a verdict (confirmed / conditional / inconclusive / refuted) with evidence cited from code, not from the graph.
 
 The two-stage split is intentional — it prevents agents from skipping energy exploration and falling back to grep, or from citing graph topology as verification.
 
@@ -56,6 +56,10 @@ Verification must use a different source than screening. Strict order:
 6. **Energy scores** — structural exposure and resistance. Screening evidence only.
 
 "The graph shows 0 auth edges" is NOT verification — it's the screening tool describing itself. "The kong.yml route definition has no plugin attachment" IS verification.
+
+When no code, config or cloud access is available, what the map recorded from them (a node's description of its route config, a policy's statements) still counts, and can support any verdict, including Confirmed. Tag it (map) and note "not checked against the running system". Edge counts, topology and energies never count.
+
+A low risk score never overrides that evidence. The model reads calls inside a cluster or network as authorized and doesn't see a missing network policy or missing service-to-service auth, so a path can score under 20 and still be Confirmed. When that happens, keep the verdict the evidence supports and say in a few words why the score is low.
 
 ## Refuted findings are successes
 
@@ -84,7 +88,7 @@ triage_load_user()
 triage_list_projects()
 ```
 
-**Profile exists:** Greet by name. List all projects with `triage_list_projects`. Show a one-line status per project (open/fixed/mitigated counts). Then **stop and ask the user** — do NOT proceed automatically:
+**Profile exists:** Don't greet. Attack-path triage (no findings) doesn't need a project: announce the mode and start. For findings triage, list all projects with `triage_list_projects`. Show a one-line status per project (open/fixed/mitigated counts). Then **stop and ask the user** — do NOT proceed automatically:
 
 **"You have [N] active project(s): [names]. Want to continue on one of these, start a new project for different infrastructure, or explore something specific?"**
 
@@ -99,6 +103,66 @@ load_graph_energies(branch_id)
 ```
 
 Use `list_repositories` and `list_branches(repo_id)` to help users find their branch ID if needed. No graph → route to `/map`.
+
+## Findings or attack paths? Pick the mode first
+
+Triage always says up front what it is prioritizing, and the whole run, including every report, follows that one choice.
+
+| What the user gave you | Mode | What gets prioritized |
+|------------------------|------|-----------------------|
+| One or more findings files, or findings already in the project's store | **Findings triage** | The findings, grouped by the fix that closes them. Attack paths are only evidence for a finding's verdict. |
+| No findings | **Attack-path triage** | The attack-path queue for the project's graph, distilled into root causes. |
+
+Say which mode you're in before anything else runs, in one line, for example: **"No findings were provided, so I'll prioritize the attack paths on this graph (412 open, highest score 78)."** If the user gave both findings and asked about paths, or it's unclear, ask which one they want prioritized. Don't mix them in one ranking.
+
+### Team tag
+
+Whichever mode you're in, every ranked group gets a tag for the team that would make the fix: [Infra], [App] or [Security]. In findings triage the tag goes on each group in `/prioritize-findings-report`; in attack-path triage it's the Team column of the ranked table.
+- **[Infra]:** the fix is in cloud, IAM, network, Kubernetes, CI/CD, registry or Terraform configuration.
+- **[App]:** the fix is in application code or a dependency the app pins.
+- **[Security]:** the fix is a security decision or control no one team owns: a risk acceptance, a policy, a detection.
+
+Pick one team: the one that would make the immediate fix. If another team owns the hardening, add it after a slash, e.g. [Infra/App]. The tag says who should look; we don't have ownership data, so never name a person. If the user asks for one team's view, show only that team's groups, in the same order and sections.
+
+### Code that isn't in the graph
+
+In both modes, when the code behind a finding or a path step isn't in the graph, follow "When the code isn't in the graph" in `/investigate`: read the code, add the node and its edges, trace through them, and tag those facts (added from code). Don't stop at "not in the graph". In the pipeline workflow, sub-agents add without committing and the pipeline commits the batch after the Investigate phase; anywhere else, ask before `commit_graph`. Only propose a mapping run when the code can't be read.
+
+### Findings triage
+
+Run the pipeline as described below. The ranked list is findings groups; each one's priority comes from its verdict and the reach of what it exposes.
+
+### Attack-path triage
+
+The goal is a short list of root causes, not one item per path: hundreds of paths usually come from a handful of configurations (one over-permissive role, one trust policy, one exposed service). This runs in the session, not through the pipeline workflow.
+
+1. **Scope.** Call `list_attack_paths(repository_id=<repo>, status="new", summary=true)` to see the open count and top scores. Up to ~50 open paths: take them all. More: look at the spread of the top scores first.
+   - **Scores spread out:** take the top band the queue actually holds (for example the top tenth, or a `min_risk_score` just under the top scores).
+   - **Scores bunched** (the top hundred or so within about a point of each other): the score can't tell them apart, so don't cut by it. Take every open path, up to the first 500, and let priority come from exploitability and impact in step 5.
+
+   Say which cut you chose, how many paths it holds and the highest score, and whether the scores were bunched. Offer all open paths as the alternative.
+2. **Inventory.** Page through with `limit=50` and `offset` until `has_more` is false (larger pages overflow the response). Group paths by starting point and show the user: total paths, the starting points by count and top score, and the most common targets. If most targets appear only once, say so and don't group them into made-up categories; the grouping that matters comes from the decisive steps in step 4.
+3. **Find the decisive steps.** For each starting point, `get_attack_path` its paths and read the steps that make them work (`read_node`, `read_edge`; facts often live on edges). A step is decisive when removing it breaks the path. Run starting points in parallel sub-agents, at most 5 at a time.
+   - **Discard hops an attacker can't walk:** edges that only record how things are built or packaged, such as containment, an image's source repository, a repository's CI identity, or a deployment's chart or module. A path that only works through such a hop isn't a real path: drop it, and say how many you dropped and why. Don't list it as Refuted.
+4. **Distill root causes.** Group the decisive steps by the configuration behind them (same role, trust policy, grant, exposed listener, shared credential, missing control). Each group is one root cause; one path can depend on two or three. Count the paths each root cause covers from the steps of the paths you paged through. `list_attack_paths(node_id=<resource>)` finds examples through a resource, but its `total` can miss paths, so don't use it as the count.
+5. **Rank and report.** Rate each root cause's exploitability and impact, take priority from the table in `/report-group-deep-dive`, and present one ranked table, highest priority first. Use the same fields `/prioritize-findings-report` uses to explain each group:
+
+   | # | Priority | Team | Root cause | Verdict | Why | Paths covered | Decisive evidence | Recommendation | Couldn't check |
+   | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |
+   | 1 | [CRITICAL] | [Infra] | <what to change>, so <what it stops or protects> | 🔴 Confirmed | <why this priority, in one line: who can reach it and what they get> | <n> paths from <starting point>, reaching <2–3 example targets> and <n> others | <the one fact that makes it work, tagged (map), (verified) or (per the finding)> | <what to do this week, in one line> | — |
+   | 2 | [MEDIUM] 🔑 | [App] | ... | 🟡 Conditional | <why this priority if confirmed> | ... | ... | ... | <what couldn't be verified>. Grant us: <the smallest read-only check that would settle it> |
+   | 3 | [MEDIUM] ❓ | [Security] | ... | 🟡 Conditional | ... | ... | ... | ... | <what couldn't be verified>. Answer: <one yes/no question> |
+
+   - **Priority** is [CRITICAL], [HIGH], [MEDIUM] or [LOW], from the table in `/report-group-deep-dive`.
+   - **Team** follows the Team tag rule above.
+   - **Root cause** is one plain sentence answering "What should I change, and why?": the change first, then what it stops. No arrows or labels.
+   - **Verdict:** 🔴 Confirmed, 🟡 Conditional, ⚪ Inconclusive or 🟢 Refuted. Refuted root causes go in a short list after the table, each with the control or config that blocks it.
+   - **Couldn't check** is "—" for Confirmed. For Conditional and Inconclusive, tag the priority 🔑 when access was missing (end with "Grant us:" and the narrowest read-only check, never broad admin access) or ❓ when it depends on a fact only the user knows (end with "Answer:" and one question).
+   - Keep cells short: under ~20 words, up to ~35 for Why and Decisive evidence.
+
+   Then offer `/report-group-deep-dive` on any of them for the full ticket-ready write-up.
+
+Same rules as findings triage: no tickets without sign-off, and no energies, path ids or node ids in what the user reads.
 
 ## Onboarding
 
@@ -118,7 +182,7 @@ Save with `triage_save_user`: `name`, `role`, `org`, `pain_points`, `ticketing_i
 
 Ask: **"What graph and findings should I work with?"** Get:
 - **Branch ID** — use `list_repositories` and `list_branches(repo_id)` to find it. No graph → route to `/map`.
-- Findings file paths — for each: scanner name, scanner version, scan date.
+- Findings file paths, if any — for each: scanner name, scanner version, scan date. Findings are optional: without them, triage prioritizes the attack-path queue (see "Findings or attack paths?" above).
 
 Then ask: **"What tools and access do you have that could help verify findings? For example: GitHub org for source code, cloud CLI access (AWS/Azure/GCP), kubectl contexts, IaC repos, security tools, documentation — anything an investigator would reach for."**
 
@@ -176,7 +240,7 @@ Before running the pipeline:
    - **Branch:** branch_id and node/edge count
    - **Sources:** each findings file with scanner name
    - **Audiences:** who receives output
-   - **Verification channels:** type, method, instructions for each. **Check for mismatches** — if method says `local_path` but instructions say "use GitHub API", flag it. If no channels are configured, that's a blocker.
+   - **Verification channels:** type, method, instructions for each. **Check for mismatches** — if method says `local_path` but instructions say "use GitHub API", flag it. If no channels are configured, say verification will use what the map recorded from code, config and cloud state, and confirm the user is fine with that.
    - **Investigation depth** and **deployment model**
 
    Ask: **"These are the settings I'll run with. Anything to change?"** Wait for confirmation.
@@ -191,7 +255,7 @@ Interactive single-finding investigation using energy tools. Start with the find
 2. Explore with `energy_node_scores`, `energy_node_neighborhood`, `energy_lowest_hop`
 3. Trace paths with `energy_trace_to_target`, `energy_momentum_path`
 4. Verify using the configured verification channels — read the actual implementation
-5. Produce a verdict: confirmed, refuted, or partial — with evidence from code/config, not the graph
+5. Produce one of the four verdicts used everywhere: Confirmed, Conditional, Inconclusive or Refuted (defined in `/trace-blast-radius`) — with evidence from code/config, not the graph
 
 Save with `triage_update_finding_group`. Validated findings carry higher authority than raw scanner output.
 

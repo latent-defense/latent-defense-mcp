@@ -1061,7 +1061,7 @@ def register(mcp: Any) -> None:
             project_id: Project identifier.
             group_id: Group being investigated.
             explore_result: JSON string of energy exploration results.
-            verdict: confirmed/refuted/partial.
+            verdict: confirmed/conditional/inconclusive/refuted.
             evidence: Verification evidence (from code/config/cloud, not graph).
             graph_corrections: JSON array of graph corrections made during investigation.
         """

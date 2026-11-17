@@ -207,9 +207,10 @@ Don't leave unknowns open. Flag as UNRESOLVED with specific action to resolve.
 - Deployment model: ${parsed.deployment_model || uc.deployment_model || 'unknown'}
 
 ### Step 6: Verdict
-- **confirmed**: real risk, no adequate control
-- **refuted**: controls hold, record what the model couldn't see (success)
-- **partial**: real but lower risk than structure suggests
+- **confirmed**: every step holds from a realistic attacker position
+- **conditional**: every step holds except one named condition
+- **inconclusive**: the graph and your checks can't settle whether it's reachable; say what's missing
+- **refuted**: a step fails for every attacker position; name the control (success)
 `
 
 const RESOLUTION_GUIDE = `
@@ -627,7 +628,7 @@ Load findings: query_findings(project_id="${profileId}", group_id="${group.group
 ${GRAPH_CORRECTION}
 
 ## Save verdict
-save_investigation(project_id="${profileId}", group_id="${group.group_id}", verdict=<confirmed|refuted|partial>, evidence=<citation>)
+save_investigation(project_id="${profileId}", group_id="${group.group_id}", verdict=<confirmed|conditional|inconclusive|refuted>, evidence=<citation>)
 update_group(project_id="${profileId}", group_id="${group.group_id}", resolution=<category>, action=<what to fix>, status="investigated", primary_audience=<who>)
 
 Return verdict and action.
@@ -635,7 +636,7 @@ Return verdict and action.
       type: 'object', properties: {
         id: { type: 'string' },
         resolution: { type: 'string', enum: ['eliminable', 'reducible', 'constrained', 'drift_prone', 'mitigated'] },
-        verdict: { type: 'string', enum: ['confirmed', 'refuted', 'partial'] },
+        verdict: { type: 'string', enum: ['confirmed', 'conditional', 'inconclusive', 'refuted'] },
         action: { type: 'string' },
         primary_audience: { type: 'string' },
       }, required: ['id', 'resolution', 'verdict', 'action'],
@@ -672,7 +673,7 @@ Load findings: query_findings(project_id="${profileId}", group_id="${group.group
 ${GRAPH_CORRECTION}
 
 ## Save verdict
-save_investigation(project_id="${profileId}", group_id="${group.group_id}", verdict=<confirmed|refuted|partial>, evidence=<citation>)
+save_investigation(project_id="${profileId}", group_id="${group.group_id}", verdict=<confirmed|conditional|inconclusive|refuted>, evidence=<citation>)
 update_group(project_id="${profileId}", group_id="${group.group_id}", resolution=<category>, action=<what to fix>, status="investigated", primary_audience=<who>)
 
 Return verdict and action.
@@ -680,7 +681,7 @@ Return verdict and action.
     type: 'object', properties: {
       id: { type: 'string' },
       resolution: { type: 'string', enum: ['eliminable', 'reducible', 'constrained', 'drift_prone', 'mitigated'] },
-      verdict: { type: 'string', enum: ['confirmed', 'refuted', 'partial'] },
+      verdict: { type: 'string', enum: ['confirmed', 'conditional', 'inconclusive', 'refuted'] },
       action: { type: 'string' },
       primary_audience: { type: 'string' },
     }, required: ['id', 'resolution', 'verdict', 'action'],

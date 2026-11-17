@@ -3642,7 +3642,7 @@ For each energy signal, verify against ground truth:
 ### 5. Verdict
 
 Produce a verdict for this group:
-- **Status**: confirmed / refuted / partial
+- **Status**: confirmed / conditional / inconclusive / refuted
 - **Resolution category**: eliminable / reducible / constrained / drift_prone / mitigated
 - **Evidence**: cite specific code, config, or cloud state
 - **Priority**: based on risk score band AND verification results

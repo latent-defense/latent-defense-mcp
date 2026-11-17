@@ -23,15 +23,17 @@ Follow-ups in the same session: `/report-group-deep-dive` for any group in the r
 
 0. Load the findings with `append_findings`, so findings, groups and investigations from earlier runs are kept and only new findings need work. Use `load_findings` only if there's no earlier store for this project.
 1. Run `/triage` on the findings. Flag duplicates (same issue at the same location) and link each to one primary finding. Group the rest by shared fix.
-2. For each group, find the code in the graph: search nodes by repository, file path and route (`grep_nodes`), and note the deployed service it maps to. If you can't map it, mark the group Inconclusive and say what mapping is missing.
+2. For each group, find the code in the graph: search nodes by repository, file path and route (`grep_nodes`), and note the deployed service it maps to. If the code isn't in the graph, add it from the code you read (see "When the code isn't in the graph" in `/investigate`). If you can't read the code either, mark the group Inconclusive and say what's missing.
 3. For each group, run `/investigate` and follow it through the graph from the entry point (`energy_node_neighborhood`, `energy_lowest_paths`, `energy_trace_to_target`, `energy_momentum_path`). Use `energy_defenses` to find the controls that block movement. Evaluate every candidate path, and keep the ones that fail. Save every path you evaluated, refuted ones included, in the group's `explore_result` (`save_investigation`).
 4. Give each path and each group one verdict:
    - **Confirmed:** every step holds in the deployed environment
    - **Refuted:** a step fails; name the control or config that blocks it. Only refute as "not deployed" if your check covered the account, project or cluster where it would run. A missing workflow or empty state elsewhere isn't proof: mark it Inconclusive and say which scope wasn't checked.
-   - **Conditional:** you verified every step except one named condition. If you couldn't see the deployed asset itself (the running image, the live cloud resource), it's Inconclusive.
-   - **Inconclusive:** you couldn't trace the path; say what's missing
+   - **Conditional:** you verified every step except one named condition
+   - **Inconclusive:** the graph and your checks can't settle whether it's reachable; say what's missing
 
-   If the triage database returns "partial", split it into Conditional or Inconclusive. When you save the group's verdict, include each finding's own verdict in the evidence, so the per-finding counts come from what's stored. If a group from an earlier run has no per-finding verdicts stored, investigate that group to fill them in rather than inferring them.
+   The graph alone can support any verdict: what the map recorded from code, config and cloud state is evidence (tag it (map)); energies and scores are not.
+
+   If the triage database returns "partial" (saved by runs before the four verdicts), split it into Conditional or Inconclusive. When you save the group's verdict, include each finding's own verdict in the evidence, so the per-finding counts come from what's stored. If a group from an earlier run has no per-finding verdicts stored, investigate that group to fill them in rather than inferring them.
 5. Connected doesn't mean affected. Only count a relationship as impact if there's a plausible attacker mechanism and enough permissions.
 6. Cite evidence for every claim (node, config, policy or file). Don't guess.
 7. If you find an issue while investigating that none of the findings cover, add it as its own group marked 🆕 (newly discovered). Always re-check it against the deployed environment, even if an earlier run already found it, then give it a verdict and priority, and rank it alongside the other groups in the section its verdict belongs to. Don't list it as a remediation unless it's verified.
@@ -61,7 +63,8 @@ The finding counts add up to <N>. The group counts match the number of
 groups listed in each section below, newly discovered groups included.
 
 ## Compared with your pipeline
-Of <N> findings, against your scanners' severity and CVSS rating:
+Of <N> findings, against your pipeline's rating (earlier verdicts if you gave
+us any, otherwise scanner severity and CVSS):
 - ✅ Agree: <n> findings (our verdict supports it)
 - ⬆️ Raised: <n> findings (worse as deployed, e.g. it crosses tenants)
 - ⬇️ Lowered: <n> findings (less exploitable as deployed, e.g. a control
@@ -74,9 +77,13 @@ The rest are in the JSON.
 - ⬇️ [CRITICAL → MEDIUM] <finding ID>: <why, in one line>
 ```
 
+Compare against the strongest rating the user gave you. If they supplied earlier assessments (for example not reachable, reachable but unconfirmed, false positive, exploitable in context), compare verdicts: Raised when we find it more exploitable than they said (they said not reachable or false positive, we say Confirmed or Conditional), Lowered when less, Agree when the same. Otherwise compare scanner severity with our priority. A Conditional finding compares at the priority it would have if confirmed. A duplicate compares as its primary. Inconclusive findings are "Can't compare". In the biggest-changes lines, show what you compared against, e.g. [not reachable → HIGH] or [CRITICAL → LOW].
+
 Title each group as one plain sentence that answers "What should I change, and why?": the change first, then what it stops. For example: "Require authentication on the internal metrics API, so workloads in the build namespace can no longer read deployment secrets through it." Don't use arrows or labels in the title.
 
-A group takes its strongest finding's verdict, in this order: Confirmed, Conditional, Refuted.
+A group takes its strongest finding's verdict, in this order: Confirmed, Conditional, Refuted. Inconclusive findings in a group don't decide its verdict; they're counted only under Why inconclusive. A group whose findings are all Inconclusive is listed under Why inconclusive, not in the group counts. Save the group with the verdict this rule gives.
+
+Tag every group with the team that would make the fix, right after the priority and any 🆕, 🔑 or ❓ tag. Use the team rule in `/triage` ("Team tag").
 
 Only list a group under Fix this week if it's verified: its verdict is Confirmed, with evidence for every step of at least one path, and its priority is Medium or higher. Confirmed groups with Low priority go under Backlog. Confirmed groups with Informational priority (real, but intentional or already compensated) go under Safe to deprioritize. Conditional findings go under Needs your input, with what's missing. This applies to newly discovered groups too.
 
@@ -87,7 +94,7 @@ Leave inconclusive findings out of the groups and their counts. Count them only 
 Sort by priority, highest first, and start each line with the priority
 in capitals: [CRITICAL], [HIGH] or [MEDIUM].
 
-1. [HIGH] <what to change>, so <what it stops or protects>
+1. [HIGH] [Infra] <what to change>, so <what it stops or protects>
    Why: <why this priority, in one line>
    Findings in this group: <n> (<n> confirmed · <n> refuted ·
    <n> conditional)
@@ -96,7 +103,7 @@ in capitals: [CRITICAL], [HIGH] or [MEDIUM].
 
 For a newly discovered group, put 🆕 after the priority, and replace the
 finding counts with how you found it and why no finding covers it:
-3. [HIGH] 🆕 <what to change>, so <what it stops or protects>
+3. [HIGH] 🆕 [App] <what to change>, so <what it stops or protects>
    Why: <why this priority, in one line>
    Found outside your findings: <how you found it>
    Recommendation: <what to do this week, in one line>
@@ -124,7 +131,7 @@ the smallest check that would settle it: one read-only command we can run
 ourselves, or the narrowest read-only scope. Never ask for broad admin
 access.
 
-<#>. [HIGH] 🔑 <what to change>, so <what it stops or protects>
+<#>. [HIGH] 🔑 [Infra] <what to change>, so <what it stops or protects>
     Why: <why this priority if confirmed, in one line>
     Findings in this group: <n> (<n> confirmed · <n> refuted ·
     <n> conditional)
@@ -132,7 +139,7 @@ access.
     Grant us: <the smallest check that would settle it, e.g. "list active
     tokens with prefix ghp_ in the org", not org-admin access>, then rerun
 
-<#>. [MEDIUM] ❓ <what to change>, so <what it stops or protects>
+<#>. [MEDIUM] ❓ [Security] <what to change>, so <what it stops or protects>
     Why: <why this priority if confirmed, in one line>
     Findings in this group: <n> (<n> confirmed · <n> refuted ·
     <n> conditional)
@@ -149,7 +156,7 @@ settle it:
 
 Then list each inconclusive newly discovered group, highest priority if
 confirmed first:
-- [HIGH] 🆕 <what to change>, so <what it stops or protects>. Couldn't
+- [HIGH] 🆕 [App] <what to change>, so <what it stops or protects>. Couldn't
   check: <what's missing>. Grant us: <smallest read-only check>, or
   Answer: <one question>
 ```

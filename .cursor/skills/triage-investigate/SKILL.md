@@ -16,7 +16,7 @@ Follow each step exactly.
 - **Stage 1 (Energy Exploration)** maps the structural position. It is screening, not investigation.
 - **Stage 2 (Code/Config Verification)** is the actual investigation. It is NOT optional.
 
-A verdict based only on energy/graph data is INVALID. If you cannot verify, report `verification_blocked` — do NOT produce a verdict.
+A verdict based only on energies, scores or graph topology is invalid. What the map recorded from code, config and cloud state (node and edge descriptions) is evidence and can support any verdict; tag it (map) and note "not checked against the running system". Energies, scores and topology alone are not evidence.
 
 ## Prerequisites
 
@@ -56,6 +56,9 @@ Read all findings in this group. Use `get_finding(project_id, idx)` for full det
 
 ### Investigation method
 
+If the group's code isn't in the graph, read it and add the node and its edges first ("When the code isn't in the graph" in `/investigate`), and record what you added in `graph_corrections`. Don't commit; the orchestrator does.
+
+
 1. `energy_node_scores` — what is this node, what are its connections?
 2. `energy_lowest_hop` — single easiest connection, follow it
 3. `energy_edge_scores` — specific transition energies on key edges
@@ -75,19 +78,21 @@ save_investigation(project_id, group_id, explore_result=<JSON of your structural
 This is the investigation. Energy exploration was screening.
 
 Use the configured verification channels (source_code, cloud_cli, kubernetes, iac).
-If no channels are available, verify via graph semantic context and note the limitation.
+If no channels are available, verify against what the map recorded from code, config and cloud state (node and edge descriptions), tag it (map), and note "not checked against the running system".
 
 ### Verification rules
 
-1. You MUST read at least one source file, config file, or cloud resource
-2. You MUST cite the specific file, line, or API response
-3. If blocked, report `verification_blocked` — do NOT produce a verdict based only on energy
+1. Read at least one source file, config file or cloud resource, or, with no channels, the map's description of one
+2. Cite the specific file, line, API response or recorded description
+3. Never base a verdict on energies or scores alone
 
 ### Verdict
 
-- **confirmed**: real risk, no adequate control
-- **refuted**: controls hold (document the defense — this is a success)
-- **partial**: real risk but lower than structure suggests
+Use the four verdicts every Latent Defense report uses (defined in `/investigate`):
+- **confirmed**: every step holds from a realistic attacker position
+- **conditional**: every step holds except one named condition
+- **inconclusive**: the graph and your checks can't settle whether it's reachable; say what's missing
+- **refuted**: a step fails for every attacker position; name the control (this is a success)
 
 ### Resolution categories
 
@@ -100,7 +105,7 @@ If no channels are available, verify via graph semantic context and note the lim
 ### Save verdict
 
 ```
-save_investigation(project_id, group_id, verdict=<confirmed|refuted|partial>, evidence=<citation>, graph_corrections=<JSON of any graph corrections made>)
+save_investigation(project_id, group_id, verdict=<confirmed|conditional|inconclusive|refuted>, evidence=<citation>, graph_corrections=<JSON of any graph corrections made>)
 update_group(project_id, group_id, resolution=<category>, action=<what to fix>, status="investigated", primary_audience=<who>)
 ```
 
